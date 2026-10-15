@@ -26,6 +26,9 @@ type Session struct {
 	AllowedHosts []string
 	// Record appends an L1 event to the session recording.
 	Record func(t contract.EventType, body any)
+	// L1, when set, makes the proxy intercept TLS with the session CA and record every request (L1 bodies, masked);
+	// nil keeps the CONNECT-only tunnel of the VS1 stage (CONTRACTS.md 8b).
+	L1 *Interception
 }
 
 type l1Blocked struct {
@@ -51,8 +54,8 @@ type l1Request struct {
 
 var emptySha = func() string { s := sha256.Sum256(nil); return hex.EncodeToString(s[:]) }()
 
-// Proxy is the egress proxy. In this stage it tunnels CONNECT only (CONTRACTS.md 8b); TLS interception, L1 bodies
-// and header injection come with the scrubber.
+// Proxy is the egress proxy: CONNECT for https (intercepted with the session CA when the session has L1 recording,
+// else a plain tunnel) and absolute-URI requests for http (CONTRACTS.md section 2).
 type Proxy struct {
 	policy      *Policy
 	log         zerolog.Logger
@@ -116,35 +119,48 @@ func (p *Proxy) handle(c net.Conn) {
 		return
 	}
 	_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
-	br := bufio.NewReader(c)
+	br := bufio.NewReaderSize(c, maxHeadBytes)
+	names, err := headerNames(br)
+	if err != nil {
+		reply(c, http.StatusBadRequest)
+		return
+	}
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		reply(c, http.StatusBadRequest)
 		return
 	}
 	_ = c.SetReadDeadline(time.Time{})
-	if req.Method != http.MethodConnect {
+	switch {
+	case req.Method == http.MethodConnect:
+		p.connect(c, br, sess, req)
+	case sess.L1 != nil && req.URL.IsAbs() && req.URL.Scheme == "http":
+		p.plainHTTP(c, br, sess, req, names)
+	default:
 		reply(c, http.StatusMethodNotAllowed)
-		return
 	}
-	host, portStr, err := net.SplitHostPort(req.Host)
-	if err != nil {
-		host, portStr = req.Host, "443"
-	}
-	host = strings.ToLower(host)
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 || port > 65535 {
-		reply(c, http.StatusBadRequest)
-		return
-	}
+}
+
+// target is an allowed, resolved and pinned destination.
+type target struct {
+	host string // lowercase, as requested
+	port int
+	ip   netip.Addr
+}
+
+func (t target) dest() string { return netip.AddrPortFrom(t.ip, uint16(t.port)).String() }
+
+// authorize applies the allowlist (by host name) and then the deny list (on the resolved address). It records and
+// answers a refusal at once (a hanging refusal slows Chromium's first page load, F1 M1 note) and reports ok=false.
+func (p *Proxy) authorize(c net.Conn, sess *Session, method, host string, port int) (target, bool) {
 	block := func(reason string, status int) {
-		sess.Record(contract.EventL1Blocked, l1Blocked{Method: http.MethodConnect, Host: host, Port: port, Reason: reason})
+		sess.Record(contract.EventL1Blocked, l1Blocked{Method: method, Host: host, Port: port, Reason: reason})
 		p.log.Info().Str("sessionId", sess.SessionID).Str("host", host).Int("port", port).Str("reason", reason).Msg("Web App egress blocked")
 		reply(c, status)
 	}
 	if !HostAllowed(host, sess.AllowedHosts) {
 		block(ReasonHostNotAllowed, http.StatusForbidden)
-		return
+		return target{}, false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), p.DialTimeout)
 	defer cancel()
@@ -156,33 +172,66 @@ func (p *Proxy) handle(c net.Conn) {
 			status = http.StatusBadGateway
 		}
 		block(reason, status)
+		return target{}, false
+	}
+	return target{host: host, port: port, ip: ip}, true
+}
+
+func (p *Proxy) dial(sess *Session, t target) (net.Conn, error) {
+	up, err := (&net.Dialer{Timeout: p.DialTimeout}).Dial("tcp", t.dest())
+	if err != nil {
+		p.log.Warn().Err(err).Str("sessionId", sess.SessionID).Str("dest", t.dest()).Msg("Web App egress: upstream dial failed")
+	}
+	return up, err
+}
+
+func (p *Proxy) connect(c net.Conn, br *bufio.Reader, sess *Session, req *http.Request) {
+	host, portStr, err := net.SplitHostPort(req.Host)
+	if err != nil {
+		host, portStr = req.Host, "443"
+	}
+	host = strings.ToLower(host)
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		reply(c, http.StatusBadRequest)
 		return
 	}
-	dest := netip.AddrPortFrom(ip, uint16(port)).String()
-	up, err := (&net.Dialer{}).DialContext(ctx, "tcp", dest)
+	t, ok := p.authorize(c, sess, http.MethodConnect, host, port)
+	if !ok {
+		return
+	}
+	up, err := p.dial(sess, t)
 	if err != nil {
-		p.log.Warn().Err(err).Str("sessionId", sess.SessionID).Str("dest", dest).Msg("Web App egress: upstream dial failed")
 		reply(c, http.StatusBadGateway)
 		return
 	}
 	defer up.Close()
+	if sess.L1 != nil {
+		p.intercept(&bufConn{Conn: c, r: br}, up, sess, t)
+		return
+	}
 	n := p.ids.Add(1)
 	sess.Record(contract.EventL1Request, l1Request{
 		ReqID: fmt.Sprintf("r-%d", n), ConnID: fmt.Sprintf("c-%d", n), Method: http.MethodConnect,
 		URL: net.JoinHostPort(host, strconv.Itoa(port)), Headers: [][]string{}, BodySha256: emptySha,
-		DestIP: ip.String(), DestPort: port,
+		DestIP: t.ip.String(), DestPort: port,
 	})
 	if _, err := io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
 	}
+	pipe(c, br, up, up)
+}
+
+// pipe copies both directions until one ends, then gives the other a bounded drain so a half-open peer cannot pin
+// the connection.
+func pipe(a net.Conn, ar io.Reader, b net.Conn, br io.Reader) {
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(up, br); closeWrite(up); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(c, up); closeWrite(c); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(b, ar); closeWrite(b); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(a, br); closeWrite(a); done <- struct{}{} }()
 	<-done
-	// One direction ended: give the other a bounded drain so a half-open peer cannot pin the tunnel.
 	deadline := time.Now().Add(30 * time.Second)
-	_ = c.SetDeadline(deadline)
-	_ = up.SetDeadline(deadline)
+	_ = a.SetDeadline(deadline)
+	_ = b.SetDeadline(deadline)
 	<-done
 }
 

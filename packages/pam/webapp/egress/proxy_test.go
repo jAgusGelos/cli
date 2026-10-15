@@ -94,13 +94,6 @@ func TestTunnelToAllowedHost(t *testing.T) {
 	require.Equal(t, "127.0.0.1", req.DestIP)
 }
 
-type bufConn struct {
-	net.Conn
-	r *bufio.Reader
-}
-
-func (b *bufConn) Read(p []byte) (int, error) { return b.r.Read(p) }
-
 func TestBlockedDestinations(t *testing.T) {
 	pol := &Policy{
 		Override: map[string]netip.Addr{
