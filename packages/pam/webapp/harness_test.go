@@ -80,6 +80,7 @@ func newFakeSupervisor(t *testing.T) *fakeSupervisor {
 }
 
 type fakeAgent struct {
+	mu       sync.Mutex
 	conn     net.Conn
 	welcome  chan contract.AgentWelcome
 	controls chan contract.AgentControl
@@ -109,8 +110,10 @@ func startFakeAgent(t *testing.T, addr, sessionID, token, mode string) *fakeAgen
 		_ = contract.WriteFrame(c, &contract.Frame{Type: contract.FrameAgentHello, Payload: b})
 		var seq uint32 = 100 // deliberately not 0: the gateway must rewrite seq on the viewer link
 		send := func(ft contract.FrameType, flags uint16, payload []byte) {
+			a.mu.Lock()
 			_ = contract.WriteFrame(c, &contract.Frame{Type: ft, Flags: flags, Seq: seq, TimestampUs: 33000, Payload: payload})
 			seq++
+			a.mu.Unlock()
 		}
 		for {
 			f, err := contract.ReadFrame(c, contract.MaxAgentPayload)
@@ -150,6 +153,28 @@ func startFakeAgent(t *testing.T, addr, sessionID, token, mode string) *fakeAgen
 		}
 	}()
 	return a
+}
+
+func (a *fakeAgent) write(ft contract.FrameType, payload []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_ = contract.WriteFrame(a.conn, &contract.Frame{Type: ft, Payload: payload})
+}
+
+// waitControl returns the next AGENT_CONTROL of the given kind.
+func (a *fakeAgent) waitControl(t *testing.T, kind string) contract.AgentControl {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case c := <-a.controls:
+			if c.Kind == kind {
+				return c
+			}
+		case <-deadline:
+			t.Fatalf("no AGENT_CONTROL %s", kind)
+		}
+	}
 }
 
 type harness struct {
@@ -396,4 +421,230 @@ func TestServiceDisabledWithoutSupervisor(t *testing.T) {
 	c := v.nextControl(t)
 	require.Equal(t, contract.ErrCodeRunnerUnavailable, c.Code)
 	require.True(t, *c.Fatal)
+}
+
+const helloJSON = `{"protocol":1,"client":"test","decoders":{"vp9":false,"h264":true}}`
+
+// startSession runs a session to session_ready and the first keyframe; it returns the viewer and the done channel.
+func startSession(t *testing.T, h *harness, p SessionParams) (*viewerSide, *fakeAgent, chan error) {
+	t.Helper()
+	gwSide, viewerConn := net.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- h.svc.HandleSession(context.Background(), gwSide, p) }()
+	v := newViewer(viewerConn)
+	v.send(t, contract.FrameHello, []byte(helloJSON))
+	require.Equal(t, contract.ControlSessionReady, v.nextControl(t).Kind)
+	require.Equal(t, contract.ControlTimeLeft, v.nextControl(t).Kind)
+	require.Equal(t, contract.FrameVideoConfig, v.next(t).Type)
+	require.Equal(t, contract.FrameVideoChunk, v.next(t).Type)
+	h.sup.mu.Lock()
+	a := h.sup.agent
+	h.sup.mu.Unlock()
+	a.waitControl(t, "live_start")
+	return v, a, done
+}
+
+func (v *viewerSide) endSession(t *testing.T, done chan error) {
+	t.Helper()
+	v.send(t, contract.FrameControlUp, []byte(`{"kind":"end_session"}`))
+	for {
+		f := v.next(t)
+		if f.Type != contract.FrameControl {
+			continue
+		}
+		var c contract.ControlDown
+		require.NoError(t, json.Unmarshal(f.Payload, &c))
+		if c.Kind == contract.ControlSessionEnding {
+			require.Equal(t, "user_end", c.Reason)
+			break
+		}
+	}
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("session did not end")
+	}
+}
+
+func l3Bodies(t *testing.T, res *recordertest.Result) []l3Input {
+	var out []l3Input
+	for _, e := range res.ByType(contract.EventL3Input) {
+		var in l3Input
+		require.NoError(t, json.Unmarshal(e.Body, &in))
+		out = append(out, in)
+	}
+	return out
+}
+
+// Viewer reattach within the grace period keeps the session: same runner, fresh session_ready, cached VIDEO_CONFIG,
+// a forced keyframe, held keys released (synthetic), and a second concurrent viewer is refused with session_in_use.
+func TestViewerReattach(t *testing.T) {
+	h := newHarness(t)
+	v1, agent, done := startSession(t, h, h.params())
+	v1.send(t, contract.FrameInput, []byte(`{"events":[{"t":"key","action":"down","code":"ShiftLeft","key":"Shift","mods":1}]}`))
+	select {
+	case <-agent.injected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no INPUT_INJECT")
+	}
+	v1.conn.Close()
+	select {
+	case rel := <-agent.injected:
+		require.Equal(t, []contract.InputEvent{{T: "key", Action: "up", Code: "ShiftLeft", Key: "Shift"}}, rel.Events)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no synthetic release on viewer disconnect")
+	}
+
+	gw2, c2 := net.Pipe()
+	attachDone := make(chan error, 1)
+	go func() { attachDone <- h.svc.HandleSession(context.Background(), gw2, h.params()) }()
+	v2 := newViewer(c2)
+	v2.send(t, contract.FrameHello, []byte(helloJSON))
+	ready := v2.nextControl(t)
+	require.Equal(t, contract.ControlSessionReady, ready.Kind)
+	require.Equal(t, contract.ControlTimeLeft, v2.nextControl(t).Kind)
+	cfg := v2.next(t)
+	require.Equal(t, contract.FrameVideoConfig, cfg.Type)
+	require.Equal(t, uint32(2), cfg.Seq, "seq restarts at 0 on the new viewer link")
+	agent.waitControl(t, "keyframe")
+
+	gw3, c3 := net.Pipe()
+	go func() { _ = h.svc.HandleSession(context.Background(), gw3, h.params()) }()
+	v3 := newViewer(c3)
+	v3.send(t, contract.FrameHello, []byte(helloJSON))
+	busy := v3.nextControl(t)
+	require.Equal(t, contract.ErrCodeSessionInUse, busy.Code)
+	require.True(t, *busy.Fatal)
+
+	v2.endSession(t, done)
+	require.NoError(t, <-attachDone)
+	h.sup.mu.Lock()
+	require.Len(t, h.sup.launches, 1, "one runner for the whole session")
+	require.Equal(t, 1, h.sup.destroyed)
+	h.sup.mu.Unlock()
+	res, err := h.backend.Verify(h.key, hSession, h.svc.RecordingPublicKey())
+	require.NoError(t, err)
+	var synthetic bool
+	for _, in := range l3Bodies(t, res) {
+		for _, ev := range in.Events {
+			synthetic = synthetic || (ev.Synthetic && ev.Code == "ShiftLeft" && ev.Action == "up")
+		}
+	}
+	require.True(t, synthetic, "synthetic release recorded in L3")
+}
+
+func TestViewerLostAfterGrace(t *testing.T) {
+	viewerGrace = 200 * time.Millisecond
+	defer func() { viewerGrace = 60 * time.Second }()
+	h := newHarness(t)
+	v, _, done := startSession(t, h, h.params())
+	v.conn.Close()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("session did not end after the grace period")
+	}
+	res, err := h.backend.Verify(h.key, hSession, h.svc.RecordingPublicKey())
+	require.NoError(t, err)
+	var end map[string]any
+	require.NoError(t, json.Unmarshal(res.Events[len(res.Events)-1].Body, &end))
+	require.Equal(t, "viewer_lost", end["reason"])
+}
+
+// A runner agent reconnecting with the same token replaces the link; the gap is recorded as continuity_unknown.
+func TestAgentReconnect(t *testing.T) {
+	h := newHarness(t)
+	v, agent, done := startSession(t, h, h.params())
+	h.sup.mu.Lock()
+	token := h.sup.launches[0].RunnerToken
+	h.sup.mu.Unlock()
+	agent.conn.Close()
+	agentAddr, _ := h.svc.addrs()
+	a2 := startFakeAgent(t, agentAddr, hSession, token, "dual")
+	require.True(t, (<-a2.welcome).OK)
+	a2.waitControl(t, "live_start")
+	// The new link streams again: the viewer gets its VIDEO_CONFIG and keyframe.
+	for {
+		if f := v.next(t); f.Type == contract.FrameVideoChunk {
+			break
+		}
+	}
+	v.endSession(t, done)
+	res, err := h.backend.Verify(h.key, hSession, h.svc.RecordingPublicKey())
+	require.NoError(t, err)
+	cu := res.ByType(contract.EventContinuityUnknown)
+	require.Len(t, cu, 1)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(cu[0].Body, &body))
+	require.Equal(t, "agent_disconnected", body["reason"])
+	require.Len(t, res.VInits, 2, "the restarted encoder sends a new init")
+}
+
+// REC_LOSS becomes a signed loss event and CONTROL recording_state; with onRecorderOverflow=terminate the session ends
+// with recording_failed.
+func TestRecLossTerminatePolicy(t *testing.T) {
+	h := newHarness(t)
+	p := h.params()
+	p.Credentials.WebApp.Settings = &api.PAMWebAppSettings{OnRecorderOverflow: "terminate"}
+	v, agent, done := startSession(t, h, p)
+	agent.write(contract.FrameRecLoss, []byte(`{"fromPtsUs":1000000,"toPtsUs":3000000,"framesLost":60,"reason":"encoder_overflow"}`))
+	var sawState, sawEnding bool
+	for !sawEnding {
+		f := v.next(t)
+		if f.Type != contract.FrameControl {
+			continue
+		}
+		var c contract.ControlDown
+		require.NoError(t, json.Unmarshal(f.Payload, &c))
+		switch c.Kind {
+		case contract.ControlRecordingState:
+			sawState = true
+			require.Equal(t, "loss", c.State)
+			require.Equal(t, int64(2000), *c.LostMs)
+		case contract.ControlSessionEnding:
+			sawEnding = true
+			require.Equal(t, "recording_failed", c.Reason)
+		}
+	}
+	require.True(t, sawState)
+	require.NoError(t, <-done)
+	res, err := h.backend.Verify(h.key, hSession, h.svc.RecordingPublicKey())
+	require.NoError(t, err)
+	losses := res.ByType(contract.EventLoss)
+	require.Len(t, losses, 1)
+	var l recorder.LossBody
+	require.NoError(t, json.Unmarshal(losses[0].Body, &l))
+	require.Equal(t, recorder.LossBody{Stream: "V", FromUs: l.FromUs, ToUs: l.FromUs + 2_000_000, Count: 60, Reason: "encoder_overflow"}, l)
+	var end map[string]any
+	require.NoError(t, json.Unmarshal(res.Events[len(res.Events)-1].Body, &end))
+	require.Equal(t, "recording_failed", end["reason"])
+}
+
+// Over the live window the gateway drops to the next keyframe, asks for one and reports viewer_degraded; the
+// recording is unaffected.
+func TestLiveWindowDegraded(t *testing.T) {
+	liveWindowFrames = 3
+	defer func() { liveWindowFrames = 60 }()
+	h := newHarness(t)
+	v, agent, done := startSession(t, h, h.params())
+	for i := 0; i < 6; i++ { // no ACKs: the window fills after 3 frames (1 already in flight)
+		agent.write(contract.FrameVideoChunk, []byte{0, 0, 0, 1, 0x41})
+	}
+	var degraded bool
+	for !degraded {
+		f := v.next(t)
+		if f.Type == contract.FrameControl {
+			var c contract.ControlDown
+			require.NoError(t, json.Unmarshal(f.Payload, &c))
+			degraded = c.Kind == contract.ControlViewerDegraded && *c.Active
+		}
+	}
+	agent.waitControl(t, "keyframe")
+	v.endSession(t, done)
+	res, err := h.backend.Verify(h.key, hSession, h.svc.RecordingPublicKey())
+	require.NoError(t, err)
+	require.Len(t, res.ByType(contract.EventViewerDegraded), 1)
+	require.Len(t, res.VMedia, 1)
 }
