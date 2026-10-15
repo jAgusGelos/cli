@@ -59,7 +59,10 @@ class NativeBridge:
                 try:
                     while not self._stop.is_set():
                         with self._lock: pending = self._out[:]; self._out.clear()
-                        for message in pending: _write(conn, message)
+                        try:
+                            for message in pending: _write(conn, message)
+                        except OSError:
+                            break
                         try: message = _read(conn)
                         except socket.timeout: message = False
                         if message is None: break
