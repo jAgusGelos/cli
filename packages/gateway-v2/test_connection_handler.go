@@ -26,6 +26,7 @@ import (
 	mssqlhandler "github.com/Infisical/infisical-merge/packages/pam/handlers/mssql"
 	oraclehandler "github.com/Infisical/infisical-merge/packages/pam/handlers/oracle"
 	snowflakehandler "github.com/Infisical/infisical-merge/packages/pam/handlers/snowflake"
+	"github.com/Infisical/infisical-merge/packages/pam/webapp/egress"
 	"github.com/go-ldap/ldap/v3"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
@@ -186,6 +187,20 @@ type webAppTestParams struct {
 	HeaderValue           string   `json:"headerValue"`
 }
 
+// webAppDialHost returns the address the Web App connection test dials for the signed target host. Sessions reach
+// a host listed in INFISICAL_WEBAPP_HOSTS_OVERRIDE through the egress proxy, which consults the override before DNS,
+// so the probe resolves it the same way; otherwise an account that works in a session fails its connection test.
+func webAppDialHost(host string) (string, error) {
+	overrides, err := egress.ParseHostsOverride(os.Getenv("INFISICAL_WEBAPP_HOSTS_OVERRIDE"))
+	if err != nil {
+		return "", fmt.Errorf("INFISICAL_WEBAPP_HOSTS_OVERRIDE: %w", err)
+	}
+	if addr, ok := overrides[strings.ToLower(host)]; ok {
+		return addr.String(), nil
+	}
+	return host, nil
+}
+
 func doWebAppConnectionTest(ctx context.Context, target rpcTarget, params webAppTestParams) error {
 	u, err := url.Parse(params.URL)
 	if err != nil || u.Scheme != "http" && u.Scheme != "https" || u.Hostname() == "" {
@@ -216,11 +231,15 @@ func doWebAppConnectionTest(ctx context.Context, target rpcTarget, params webApp
 		}
 		tlsConfig.RootCAs = pool
 	}
+	dialHost, err := webAppDialHost(target.host)
+	if err != nil {
+		return err
+	}
 	dialer := &net.Dialer{}
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(target.host, strconv.Itoa(dialPort)))
+			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(dialHost, strconv.Itoa(dialPort)))
 		},
 	}
 	client := &http.Client{Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
