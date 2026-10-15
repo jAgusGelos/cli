@@ -61,4 +61,6 @@ const (
 	launchTimeout        = 90 * time.Second
 	destroyTimeout       = 30 * time.Second
 	recorderCloseTimeout = 60 * time.Second
+	// Covers the agent's encoder stop (recorder.py waits up to 15 s for ffmpeg to flush the last fragment).
+	agentDrainTimeout = 20 * time.Second
 )

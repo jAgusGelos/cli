@@ -18,10 +18,14 @@ type agentLink struct {
 
 	mu  sync.Mutex
 	seq uint32
+
+	// done is closed when readAgent stops reading this link, so every frame the agent sent before closing it has
+	// been handled.
+	done chan struct{}
 }
 
 func newAgentLink(c net.Conn, hello contract.AgentHello) *agentLink {
-	return &agentLink{conn: c, hello: hello, start: time.Now()}
+	return &agentLink{conn: c, hello: hello, start: time.Now(), done: make(chan struct{})}
 }
 
 func (a *agentLink) send(t contract.FrameType, payload []byte) error {
