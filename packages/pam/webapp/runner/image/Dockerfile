@@ -23,6 +23,8 @@ RUN mkdir -p /opt/iwa/keys /etc/chromium/native-messaging-hosts \
     && openssl rsa -in /opt/iwa/keys/ext.pem -pubout -outform DER -out /tmp/ext.pub.der 2>/dev/null \
     && EXT_ID=$(python3 -c 'import hashlib; b=hashlib.sha256(open("/tmp/ext.pub.der","rb").read()).digest()[:16]; print("".join(chr(97+(x>>4)) + chr(97+(x&15)) for x in b))') \
     && sed -i "s/__EXTENSION_ID__/$EXT_ID/g" /opt/iwa/ext/updates.xml \
+    && printf '%s\n' "$EXT_ID" >/opt/iwa/ext-id \
+    && sed -i "s#chrome-extension://\*/#chrome-extension://$EXT_ID/#" /etc/chromium/native-messaging-hosts/com.infisical.rbi.json \
     && rm -rf /opt/iwa/keys /tmp/ext.pub.der \
     && chmod 0755 /opt/iwa/entrypoint.sh /opt/iwa/netns-rules.sh /opt/iwa/netprobe.py /opt/iwa/nativehost.py \
     && chmod -R a-w,a+rX /opt/iwa /etc/chromium

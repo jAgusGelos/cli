@@ -36,6 +36,8 @@ certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n iwa-runner-ca -i "$RUN_DIR/run
 rm -f "$RUN_DIR/runner-ca.crt"
 
 cp /opt/iwa/policies/rbi.json "$POLICY_DIR/rbi.json"
+EXT_ID=$(cat /opt/iwa/ext-id)
+export IWA_EXTENSION_ID="$EXT_ID"
 python3 - "$POLICY_DIR/session.json" <<'PY' || fail "invalid IWA_ALLOWED_HOSTS"
 import json, os, re, sys
 hosts = json.loads(os.environ["IWA_ALLOWED_HOSTS"])
@@ -52,7 +54,7 @@ policy = {
         "ProxyServer": "http://" + os.environ["IWA_PROXY_ADDR"],
         "ProxyBypassList": "<-loopback>",
     },
-    "ExtensionInstallForcelist": ["*;file:///opt/iwa/ext/updates.xml"],
+    "ExtensionInstallForcelist": [os.environ["IWA_EXTENSION_ID"] + ";file:///opt/iwa/ext/updates.xml"],
 }
 with open(sys.argv[1], "w") as f:
     json.dump(policy, f, indent=2)
@@ -70,7 +72,6 @@ chromium --kiosk --no-first-run --noerrdialogs --disable-session-crashed-bubble 
   --disable-background-networking --disable-component-update \
   --user-data-dir="$HOME/profile" --password-store=basic --window-position=0,0 \
   --window-size="${WIDTH},${HEIGHT}" \
-  --load-extension=/opt/iwa/ext \
   --proxy-server="http://$IWA_PROXY_ADDR" --proxy-bypass-list="<-loopback>" \
   "$IWA_START_URL" >>"$RUN_DIR/chromium.log" 2>&1 &
 
