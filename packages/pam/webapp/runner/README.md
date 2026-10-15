@@ -87,10 +87,15 @@ Extra scenarios (each still runs the default checks):
 
 ## Extension and download controls (M3)
 
-The image packs `ext/` into `ext.crx` with a build-local RSA key and serves an update manifest at
-`file:///opt/iwa/ext/updates.xml`. The managed policy force-installs it and the Chromium command also loads the same
-immutable extension directory as a delivery fallback. The extension registers `com.infisical.rbi`; the native host
-uses `/tmp/iwa/native.sock` and never writes credentials to logs. The agent forwards `ext_hello`,
+Do not add `ExtensionInstallForcelist` or `ExtensionInstallBlocklist`: either one stops the extension from loading in
+the sandboxed runner (a forcelisted id makes Chromium ignore the command-line copy, and the policy install from a
+`file://` update URL only completes with `--no-sandbox`; the blocklist also blocks the command-line copy). The
+Chromium command loads the immutable extension directory `/opt/iwa/ext` with `--load-extension`. No other extension
+can be installed: `ExtensionInstallSources` is empty, developer mode is off, `chrome://` and every non-app URL are
+blocked, and only the image sets Chromium flags. The image injects a build-local RSA public key into the manifest
+`key`, which fixes the extension id that the native host's `allowed_origins` pins. The extension registers
+`com.infisical.rbi`; the native host uses `/tmp/iwa/native.sock` and never writes credentials to logs. The agent
+forwards `ext_hello`,
 `credential_injected`, `login_result`, `guard_closed`, `nav_blocked`, `pong`, and `download` as `AGENT_EVENT` frames.
 Downloads are forced to `/quarantine`; the agent-side completion path hashes the file before emitting `download`.
 

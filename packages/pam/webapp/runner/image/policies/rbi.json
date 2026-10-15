@@ -9,9 +9,6 @@
   ],
   "DeveloperToolsAvailability": 2,
   "RemoteDebuggingAllowed": false,
-  "ExtensionInstallBlocklist": [
-    "*"
-  ],
   "ExtensionInstallSources": [],
   "ExtensionAllowedTypes": [
     "extension"
