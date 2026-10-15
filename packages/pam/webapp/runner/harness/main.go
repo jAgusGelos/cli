@@ -17,23 +17,24 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Infisical/infisical-merge/packages/pam/webapp/contract"
+	"github.com/Infisical/infisical-merge/packages/pam/webapp/supervisor"
 )
 
 const (
-	hostAddress    = "172.28.0.1"
-	sessionLabel   = "infisical.webapp.session"
 	defaultImage   = "infisical-webapp-runner:dev"
 	demoAppName    = "iwa-demo-app"
 	typedText      = "iwa harness 123"
@@ -67,7 +68,7 @@ type options struct {
 
 func parseFlags() options {
 	var o options
-	flag.StringVar(&o.socket, "socket", envOr("INFISICAL_WEBAPP_SUPERVISOR_SOCKET", "/tmp/infisical-webapp/supervisor.sock"), "supervisor unix socket")
+	flag.StringVar(&o.socket, "socket", envOr(supervisor.EnvSocket, supervisor.DefaultSocketPath), "supervisor unix socket")
 	flag.StringVar(&o.image, "image", "", "allowlisted image ref name@sha256:<id> (default: resolved from "+defaultImage+")")
 	flag.IntVar(&o.agentPort, "agent-port", 17701, "agent link port on 172.28.0.1 (never 7701)")
 	flag.IntVar(&o.proxyPort, "proxy-port", 13128, "CONNECT proxy port on 172.28.0.1 (never 3128)")
@@ -236,14 +237,18 @@ func (h *harness) addCheck(name string, ok, fatal bool, detail string, args ...a
 	h.mu.Lock()
 	h.checks = append(h.checks, check{Name: name, OK: ok, Fatal: fatal, Detail: detail})
 	h.mu.Unlock()
-	state := "PASS"
-	if !ok {
-		state = "FAIL"
-		if !fatal {
-			state = "WARN"
-		}
+	h.logger.Printf("check %s: %s (%s)", checkState(ok, fatal), name, detail)
+}
+
+func checkState(ok, fatal bool) string {
+	switch {
+	case ok:
+		return "PASS"
+	case fatal:
+		return "FAIL"
+	default:
+		return "WARN"
 	}
-	h.logger.Printf("check %s: %s (%s)", state, name, detail)
 }
 
 func newUUID() string {
@@ -254,11 +259,11 @@ func newUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func (h *harness) runnerName() string { return "iwa-runner-" + h.short }
+func (h *harness) runnerName() string { return supervisor.RunnerName(h.short) }
 
 func (h *harness) execute() {
 	h.sessionID = newUUID()
-	h.short = strings.ReplaceAll(h.sessionID, "-", "")[:12]
+	h.short = supervisor.ShortID(h.sessionID)
 	tok := make([]byte, 32)
 	_, _ = rand.Read(tok)
 	h.token = base64.RawURLEncoding.EncodeToString(tok)
@@ -280,13 +285,13 @@ func (h *harness) execute() {
 
 	h.ensureDemoApp()
 
-	agentLn, err := net.Listen("tcp", net.JoinHostPort(hostAddress, strconv.Itoa(h.o.agentPort)))
+	agentLn, err := net.Listen("tcp", net.JoinHostPort(supervisor.HostAddress, strconv.Itoa(h.o.agentPort)))
 	if err != nil {
 		h.add("bind agent endpoint", false, "%v", err)
 		return
 	}
 	defer agentLn.Close()
-	proxyLn, err := net.Listen("tcp", net.JoinHostPort(hostAddress, strconv.Itoa(h.o.proxyPort)))
+	proxyLn, err := net.Listen("tcp", net.JoinHostPort(supervisor.HostAddress, strconv.Itoa(h.o.proxyPort)))
 	if err != nil {
 		h.add("bind proxy", false, "%v", err)
 		return
@@ -306,24 +311,10 @@ func (h *harness) execute() {
 		h.add("read CA", false, "%v", err)
 		return
 	}
-	req := map[string]any{
-		"sessionId":        h.sessionID,
-		"image":            h.imageRef,
-		"runnerToken":      h.token,
-		"gatewayAgentAddr": net.JoinHostPort(hostAddress, strconv.Itoa(h.o.agentPort)),
-		"egressProxyAddr":  net.JoinHostPort(hostAddress, strconv.Itoa(h.o.proxyPort)),
-		"startUrl":         h.o.startURL,
-		"allowedHosts":     allowed,
-		"caPem":            string(caPem),
-		"policy":           map[string]any{"clipboard": "off", "downloads": "quarantine", "uploads": "block", "kiosk": true},
-		"display":          map[string]int{"width": 1280, "height": 720, "framerate": 30},
-		"recording":        map[string]int{"segmentSeconds": segmentSeconds, "bitrateKbps": 1500, "crf": 26},
-		"resources":        map[string]any{"cpus": 1.5, "memoryMb": 1536, "pidsLimit": 512},
-		"watermark":        map[string]string{"text": "iwa-harness " + h.short},
-	}
+	req := h.launchRequest(allowed, caPem)
 
 	// The supervisor must refuse a bare tag even though it names the same image.
-	bad := cloneMap(req)
+	bad := maps.Clone(req)
 	bad["sessionId"] = newUUID()
 	bad["image"] = defaultImage
 	code, body, _ = h.call("POST", "/v1/runners", bad)
@@ -357,12 +348,22 @@ func (h *harness) execute() {
 	}
 }
 
-func cloneMap(m map[string]any) map[string]any {
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[k] = v
+func (h *harness) launchRequest(allowed []string, caPem []byte) map[string]any {
+	return map[string]any{
+		"sessionId":        h.sessionID,
+		"image":            h.imageRef,
+		"runnerToken":      h.token,
+		"gatewayAgentAddr": net.JoinHostPort(supervisor.HostAddress, strconv.Itoa(h.o.agentPort)),
+		"egressProxyAddr":  net.JoinHostPort(supervisor.HostAddress, strconv.Itoa(h.o.proxyPort)),
+		"startUrl":         h.o.startURL,
+		"allowedHosts":     allowed,
+		"caPem":            string(caPem),
+		"policy":           map[string]any{"clipboard": "off", "downloads": "quarantine", "uploads": "block", "kiosk": true},
+		"display":          map[string]int{"width": 1280, "height": 720, "framerate": 30},
+		"recording":        map[string]int{"segmentSeconds": segmentSeconds, "bitrateKbps": 1500, "crf": 26},
+		"resources":        map[string]any{"cpus": 1.5, "memoryMb": 1536, "pidsLimit": 512},
+		"watermark":        map[string]string{"text": "iwa-harness " + h.short},
 	}
-	return out
 }
 
 func (h *harness) resolveImage() error {
@@ -383,7 +384,6 @@ func (h *harness) resolveImage() error {
 	return nil
 }
 
-// call talks to the supervisor and appends a redacted line to supervisor-calls.log.
 func (h *harness) call(method, path string, body any) (int, []byte, error) {
 	var rd io.Reader
 	logged := ""
@@ -394,7 +394,7 @@ func (h *harness) call(method, path string, body any) (int, []byte, error) {
 		}
 		rd = bytes.NewReader(b)
 		if m, ok := body.(map[string]any); ok {
-			red := cloneMap(m)
+			red := maps.Clone(m)
 			if _, ok := red["runnerToken"]; ok {
 				red["runnerToken"] = "<redacted>"
 			}
@@ -516,11 +516,7 @@ func (h *harness) handleProxyConn(c net.Conn, allowed []string, overrides map[st
 		return
 	}
 	host = strings.ToLower(host)
-	ok := false
-	for _, a := range allowed {
-		ok = ok || host == a
-	}
-	if !ok {
+	if !slices.Contains(allowed, host) {
 		deny(http.StatusForbidden, "host not in allowlist")
 		return
 	}
@@ -622,13 +618,9 @@ func (h *harness) report() int {
 	fmt.Println()
 	fmt.Printf("%-6s %-62s %s\n", "RESULT", "CHECK", "DETAIL")
 	for _, c := range h.checks {
-		state := "PASS"
-		if !c.OK {
-			state = "WARN"
-			if c.Fatal {
-				state = "FAIL"
-				failed++
-			}
+		state := checkState(c.OK, c.Fatal)
+		if state == "FAIL" {
+			failed++
 		}
 		fmt.Printf("%-6s %-62s %s\n", state, c.Name, c.Detail)
 	}

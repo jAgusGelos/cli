@@ -58,7 +58,6 @@ func charKey(r rune) (code string, shift bool) {
 
 func (h *harness) ts() float64 { return float64(h.sinceStartMs()) }
 
-// sendInput sends one INPUT_INJECT batch and paces like a viewer.
 func (h *harness) sendInput(evs ...contract.InputEvent) {
 	if err := h.send(contract.FrameInputInject, contract.InputBatch{Events: evs}); err != nil {
 		h.logger.Printf("INPUT_INJECT send: %v", err)
@@ -66,23 +65,25 @@ func (h *harness) sendInput(evs ...contract.InputEvent) {
 	time.Sleep(40 * time.Millisecond)
 }
 
+func (h *harness) stamped(ev contract.InputEvent) contract.InputEvent {
+	ev.Ts = h.ts()
+	return ev
+}
+
 // press sends a key with modifiers the way a browser viewer does: each modifier's own keydown, the key down/up with
 // the mods bitmask, then the modifiers released in reverse order.
 func (h *harness) press(code, key string, mods ...string) {
-	m := 0
-	for _, mod := range mods {
-		m |= modBits[mod]
-		h.sendInput(contract.InputEvent{T: "key", Action: "down", Code: mod, Key: modKeys[mod], Mods: m, Ts: h.ts()})
+	evs := comboEvents(code, key, mods...)
+	n := len(mods)
+	for _, ev := range evs[:n] {
+		h.sendInput(h.stamped(ev))
 	}
-	h.sendInput(contract.InputEvent{T: "key", Action: "down", Code: code, Key: key, Mods: m, Ts: h.ts()},
-		contract.InputEvent{T: "key", Action: "up", Code: code, Key: key, Mods: m, Ts: h.ts()})
-	for i := len(mods) - 1; i >= 0; i-- {
-		m &^= modBits[mods[i]]
-		h.sendInput(contract.InputEvent{T: "key", Action: "up", Code: mods[i], Key: modKeys[mods[i]], Mods: m, Ts: h.ts()})
+	h.sendInput(h.stamped(evs[n]), h.stamped(evs[n+1]))
+	for _, ev := range evs[n+2:] {
+		h.sendInput(h.stamped(ev))
 	}
 }
 
-// comboEvents is press as one event list, for a single INPUT_INJECT batch.
 func comboEvents(code, key string, mods ...string) []contract.InputEvent {
 	var evs []contract.InputEvent
 	m := 0
@@ -99,15 +100,19 @@ func comboEvents(code, key string, mods ...string) []contract.InputEvent {
 	return evs
 }
 
+func charPress(r rune) (code, key string, mods []string) {
+	code, shift := charKey(r)
+	if shift {
+		mods = []string{"ShiftLeft"}
+	}
+	return code, string(r), mods
+}
+
 func (h *harness) textEvents(s string) []contract.InputEvent {
 	var evs []contract.InputEvent
 	for _, r := range s {
-		code, shift := charKey(r)
-		if shift {
-			evs = append(evs, comboEvents(code, string(r), "ShiftLeft")...)
-		} else {
-			evs = append(evs, comboEvents(code, string(r))...)
-		}
+		code, key, mods := charPress(r)
+		evs = append(evs, comboEvents(code, key, mods...)...)
 	}
 	ts := h.ts()
 	for i := range evs {
@@ -118,12 +123,8 @@ func (h *harness) textEvents(s string) []contract.InputEvent {
 
 func (h *harness) typeString(s string) {
 	for _, r := range s {
-		code, shift := charKey(r)
-		if shift {
-			h.press(code, string(r), "ShiftLeft")
-		} else {
-			h.press(code, string(r))
-		}
+		code, key, mods := charPress(r)
+		h.press(code, key, mods...)
 	}
 }
 
@@ -166,7 +167,6 @@ type demoEntry struct {
 	Body   string  `json:"body"`
 }
 
-// demoLog returns the demo app's JSON log entries since the runner launch.
 func (h *harness) demoLog() ([]demoEntry, []byte, error) {
 	since := h.launchAt.Add(-2 * time.Second).UTC().Format(time.RFC3339)
 	out, err := exec.Command("docker", "logs", "--since", since, demoAppName).CombinedOutput()
@@ -219,7 +219,6 @@ func (h *harness) waitForStartPage(max time.Duration) {
 		time.Since(h.launchAt).Round(100*time.Millisecond))
 }
 
-// verifyDemoApp reads the demo app's JSON log since launch for the start page and the input probe events.
 func (h *harness) verifyDemoApp() {
 	entries, raw, err := h.demoLog()
 	if err != nil {

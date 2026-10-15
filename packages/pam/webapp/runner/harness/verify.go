@@ -11,28 +11,30 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Infisical/infisical-merge/packages/pam/webapp/contract"
+	"github.com/Infisical/infisical-merge/packages/pam/webapp/supervisor"
 )
 
 // netnsCheck runs the image's probe inside the runner netns: host ports 80/8080 and DNS must fail, the two gateway
 // ports must connect.
 func (h *harness) netnsCheck() {
-	agent := fmt.Sprintf("tcp:%s:%d", hostAddress, h.o.agentPort)
-	proxy := fmt.Sprintf("tcp:%s:%d", hostAddress, h.o.proxyPort)
-	want := map[string]bool{
-		"tcp:172.28.0.1:80": false, "tcp:172.28.0.1:8080": false, agent: true, proxy: true, "dns:iwa-demo-app": false,
-	}
+	hostProbe := func(port int) string { return fmt.Sprintf("tcp:%s:%d", supervisor.HostAddress, port) }
+	http80, http8080 := hostProbe(80), hostProbe(8080)
+	agent, proxy := hostProbe(h.o.agentPort), hostProbe(h.o.proxyPort)
+	dns := "dns:" + demoAppName
+	want := map[string]bool{http80: false, http8080: false, agent: true, proxy: true, dns: false}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	args := []string{"run", "--rm", "--network", "container:iwa-netns-" + h.short, "--label", sessionLabel + "=" + h.sessionID,
+	args := []string{"run", "--rm", "--network", "container:" + supervisor.PauseName(h.short), "--label", supervisor.SessionLabel + "=" + h.sessionID,
 		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "1000:1000",
 		"--entrypoint", "python3", h.imageID, "/opt/iwa/netprobe.py",
-		"tcp:172.28.0.1:80", "tcp:172.28.0.1:8080", agent, proxy, "dns:iwa-demo-app"}
+		http80, http8080, agent, proxy, dns}
 	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 	results := []map[string]any{}
 	got := map[string]bool{}
@@ -85,9 +87,8 @@ func (h *harness) statusCheck(want string) {
 		"status %d state %s ip %s", code, st.State, st.IP)
 }
 
-// captureRunnerLogs saves the runner's docker logs (redacted) and checks the token never appears.
 func (h *harness) captureRunnerLogs() {
-	name := "iwa-runner-" + h.short
+	name := h.runnerName()
 	out, err := exec.Command("docker", "logs", name).CombinedOutput()
 	if err != nil {
 		h.add("runner logs captured", false, "%v", err)
@@ -111,7 +112,7 @@ func (h *harness) destroy() {
 		h.add(fmt.Sprintf("DELETE runner (call %d) returns 200 destroyed", i+1),
 			err == nil && code == http.StatusOK && bytes.Contains(body, []byte(`"destroyed"`)), "status %d", code)
 	}
-	out, err := exec.Command("docker", "ps", "-a", "--filter", "label="+sessionLabel+"="+h.sessionID,
+	out, err := exec.Command("docker", "ps", "-a", "--filter", "label="+supervisor.SessionLabel+"="+h.sessionID,
 		"--format", "{{.Names}}").Output()
 	left := strings.Fields(string(out))
 	h.add("no containers left for the session", err == nil && len(left) == 0, "leftover %v", left)
@@ -132,7 +133,6 @@ func (h *harness) scanHarnessLogs() {
 	h.add("runner token absent from harness and supervisor logs", len(leaks) == 0, "scanned %d files, leaks in %v", len(files), leaks)
 }
 
-// nalTypes lists the H.264 NAL unit types of an Annex B buffer.
 func nalTypes(b []byte) []int {
 	var out []int
 	for i := 0; i+3 < len(b); i++ {
@@ -161,15 +161,6 @@ func codecOf(vc *contract.VideoConfig) string {
 	return vc.Codec
 }
 
-func hasInt(xs []int, v int) bool {
-	for _, x := range xs {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
 func ffprobeJSON(args ...string) (map[string]any, error) {
 	out, err := exec.Command("ffprobe", append([]string{"-v", "error", "-of", "json"}, args...)...).Output()
 	if err != nil {
@@ -194,47 +185,62 @@ func firstStream(m map[string]any) map[string]any {
 
 func (h *harness) verifyOutputs() {
 	h.mu.Lock()
-	vc, chunks, first, kfAt, inputChunk := h.videoConfig, append([]chunkInfo(nil), h.chunks...), h.firstChunk, h.kfRequestAt, h.inputChunk
-	recInit, segs := h.recInit, append([]segInfo(nil), h.segs...)
+	vc, chunks, first, kfAt, inputChunk := h.videoConfig, slices.Clone(h.chunks), h.firstChunk, h.kfRequestAt, h.inputChunk
+	recInit, segs := h.recInit, slices.Clone(h.segs)
 	h.mu.Unlock()
 	if h.launchAt.IsZero() {
 		return
 	}
+	h.verifyLiveConfig(vc, chunks, first)
+	h.verifyKeyframeAnswer(chunks, kfAt)
+	h.verifyLiveDecode(chunks, inputChunk)
+	h.verifyRecording(recInit, segs)
+	h.verifyDemoApp()
+	h.finishLockdown()
+	h.finishFaults()
+	h.writeMeasure()
+	h.scanHarnessLogs()
+}
 
+func (h *harness) verifyLiveConfig(vc *contract.VideoConfig, chunks []chunkInfo, first []byte) {
 	if h.o.codec == "vp9" {
 		// CONTRACTS 1.6: VP9 live is announced as vp09.00.10.08 with no format field; the recording stays H.264.
 		h.add("VIDEO_CONFIG vp09.00.10.08 without format", vc != nil && vc.Codec == contract.CodecStringVP9Live && vc.Format == "",
 			"%+v", vc)
 		h.add("first VIDEO_CHUNK is a keyframe (flag and VP9 key frame header)",
 			len(chunks) > 0 && chunks[0].Keyframe && vp9Keyframe(first), "chunks %d, first bytes % x", len(chunks), headBytes(first, 4))
-	} else {
-		// CONTRACTS 1.6: codec is the exact WebCodecs string of the stream, so it must be an H.264 Constrained Baseline
-		// avc1 string (profile 0x42, the family the viewer probes with avc1.42E01F) equal to what the first SPS says.
-		h.add("VIDEO_CONFIG avc1.42xxxx annexb", vc != nil && strings.HasPrefix(strings.ToLower(vc.Codec), "avc1.42") && vc.Format == "annexb",
-			"%+v", vc)
-		h.add("VIDEO_CONFIG codec matches the stream SPS", vc != nil && strings.EqualFold(vc.Codec, spsCodec(first)),
-			"config %v, SPS says %s", codecOf(vc), spsCodec(first))
-		nals := nalTypes(first)
-		h.add("first VIDEO_CHUNK is a keyframe (flag and IDR with SPS/PPS)",
-			len(chunks) > 0 && chunks[0].Keyframe && hasInt(nals, 5) && hasInt(nals, 7) && hasInt(nals, 8),
-			"chunks %d, first NAL types %v", len(chunks), nals)
+		return
 	}
+	// CONTRACTS 1.6: codec is the exact WebCodecs string of the stream, so it must be an H.264 Constrained Baseline
+	// avc1 string (profile 0x42, the family the viewer probes with avc1.42E01F) equal to what the first SPS says.
+	h.add("VIDEO_CONFIG avc1.42xxxx annexb", vc != nil && strings.HasPrefix(strings.ToLower(vc.Codec), "avc1.42") && vc.Format == "annexb",
+		"%+v", vc)
+	h.add("VIDEO_CONFIG codec matches the stream SPS", vc != nil && strings.EqualFold(vc.Codec, spsCodec(first)),
+		"config %v, SPS says %s", codecOf(vc), spsCodec(first))
+	nals := nalTypes(first)
+	h.add("first VIDEO_CHUNK is a keyframe (flag and IDR with SPS/PPS)",
+		len(chunks) > 0 && chunks[0].Keyframe && slices.Contains(nals, 5) && slices.Contains(nals, 7) && slices.Contains(nals, 8),
+		"chunks %d, first NAL types %v", len(chunks), nals)
+}
 
-	if kfAt >= 0 {
-		idx := -1
-		for _, c := range chunks {
-			if c.Index >= kfAt && c.Keyframe {
-				idx = c.Index
-				break
-			}
-		}
-		h.add("AGENT_CONTROL keyframe answered within 2 frames", idx >= 0 && idx-kfAt <= 3,
-			"requested at chunk %d, keyframe chunk %d (delta %d; one chunk of slack for frames already in flight)",
-			kfAt, idx, idx-kfAt)
-	} else {
+func (h *harness) verifyKeyframeAnswer(chunks []chunkInfo, kfAt int) {
+	if kfAt < 0 {
 		h.add("AGENT_CONTROL keyframe answered within 2 frames", false, "keyframe never requested")
+		return
 	}
+	idx := -1
+	for _, c := range chunks {
+		if c.Index >= kfAt && c.Keyframe {
+			idx = c.Index
+			break
+		}
+	}
+	h.add("AGENT_CONTROL keyframe answered within 2 frames", idx >= 0 && idx-kfAt <= 3,
+		"requested at chunk %d, keyframe chunk %d (delta %d; one chunk of slack for frames already in flight)",
+		kfAt, idx, idx-kfAt)
+}
 
+func (h *harness) verifyLiveDecode(chunks []chunkInfo, inputChunk int) {
 	live := filepath.Base(livePath(h.o.out, h.o.codec))
 	in := ffmpegInput(h.o.out, h.o.codec)
 	probe := append(append([]string{}, in[:2]...), "-count_frames", "-select_streams", "v:0",
@@ -251,7 +257,9 @@ func (h *harness) verifyOutputs() {
 	if inputChunk > 0 {
 		h.extractFrame(inputChunk, filepath.Join(h.o.out, "frame-live-before-input.png"))
 	}
+}
 
+func (h *harness) verifyRecording(recInit *contract.RecInitMeta, segs []segInfo) {
 	h.add("REC_INIT received", recInit != nil, "%+v", recInit)
 	shaBad := []int{}
 	for _, s := range segs {
@@ -270,20 +278,15 @@ func (h *harness) verifyOutputs() {
 	if len(dups) > 0 {
 		h.add("re-sent REC_SEGMENTs identical to the first copy", sameSha(segs), "re-sent indexes %v", dups)
 	}
-	if recInit != nil {
-		for _, s := range uniq {
-			h.verifySegment(s, s.Meta.SegmentIndex == 1)
-		}
-		if len(uniq) == 0 || uniq[0].Meta.SegmentIndex != 1 {
-			h.add("segment 1 is H.264 High, 10 s +/- 1 frame, starts with IDR", false, "segment 1 missing")
-		}
+	if recInit == nil {
+		return
 	}
-
-	h.verifyDemoApp()
-	h.finishLockdown()
-	h.finishFaults()
-	h.writeMeasure()
-	h.scanHarnessLogs()
+	for _, s := range uniq {
+		h.verifySegment(s, s.Meta.SegmentIndex == 1)
+	}
+	if len(uniq) == 0 || uniq[0].Meta.SegmentIndex != 1 {
+		h.add("segment 1 is H.264 High, 10 s +/- 1 frame, starts with IDR", false, "segment 1 missing")
+	}
 }
 
 func headBytes(b []byte, n int) []byte {
@@ -387,7 +390,7 @@ func (h *harness) verifySegment(s segInfo, strict bool) {
 	annexb, _ := exec.Command("ffmpeg", "-v", "error", "-i", concat, "-frames:v", "1", "-c:v", "copy",
 		"-bsf:v", "h264_mp4toannexb", "-f", "h264", "-").Output()
 	nals := nalTypes(annexb)
-	idr := firstKey == "1" && firstPict == "I" && hasInt(nals, 5)
+	idr := firstKey == "1" && firstPict == "I" && slices.Contains(nals, 5)
 
 	ok := st["codec_name"] == "h264" && st["profile"] == "High" && idr && (durOK || !strict)
 	h.addCheck(name, ok, strict, "codec %v profile %v length %.3fs (%d frames @ %.2f fps, meta %d frames, pts %d..%d us, probed end %.3fs) first frame key=%s pict=%s NALs %v",

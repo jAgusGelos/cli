@@ -42,7 +42,7 @@ func TestParseStats(t *testing.T) {
 }
 
 func TestExtensionsOK(t *testing.T) {
-	ok, found := extensionsOK(profileExtensions + "/lkjooopbmemjeafdccpphemkofjpfiao/1.0\n" + profileExtensions + "/abc/1\n")
+	ok, found := extensionsOK(profileExtensions + "/" + infisicalExtensionID + "/1.0\n" + profileExtensions + "/abc/1\n")
 	if ok || len(found) != 1 || found[0] != "abc" {
 		t.Fatalf("got %v %v", ok, found)
 	}

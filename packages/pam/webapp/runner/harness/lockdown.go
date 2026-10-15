@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -19,8 +20,23 @@ const (
 	rogueURL          = "https://app.corp.internal/rogue.crx"
 	profileExtensions = "/home/rbi/profile/Default/Extensions"
 	// Tab stops on the demo app's /home before the #rogue-crx link (links and buttons in document order).
-	rogueTabStops = 10
+	rogueTabStops        = 10
+	infisicalExtensionID = "lkjooopbmemjeafdccpphemkofjpfiao"
+	eventWatchdogClosed  = "watchdog_closed"
 )
+
+const (
+	stepBaseline    = "baseline"
+	stepRogueCRX    = "rogue CRX install"
+	stepF12         = "F12"
+	stepDevTools    = "Ctrl+Shift+I"
+	stepPrint       = "Ctrl+P"
+	stepNewWindow   = "Ctrl+N escape window"
+	stepSettings    = "typed chrome://settings"
+	stepTaskManager = "Shift+Esc Task Manager + watchdog"
+)
+
+var slugRE = regexp.MustCompile(`[^a-z0-9]+`)
 
 type windowInfo struct {
 	ID       string `json:"id"`
@@ -62,7 +78,6 @@ type lockdownRun struct {
 
 var childRE = regexp.MustCompile(`^\s*(0x[0-9a-f]+) (?:"(.*)"|\(has no name\)): \((.*?)\)\s+(\S+)`)
 
-// windows lists the top-level X11 windows of the runner display with their map state.
 func (h *harness) windows() []windowInfo {
 	script := `xwininfo -root -children; echo ---; for w in $(xwininfo -root -children | awk '$1 ~ /^0x/ {print $1}'); do ` +
 		`printf '%s ' "$w"; xwininfo -id "$w" | awk '/Map State/ {print $3}'; done`
@@ -139,30 +154,12 @@ func (h *harness) runLockdown() {
 	h.mu.Unlock()
 	_ = os.MkdirAll(r.EvidenceDir, 0o755)
 	h.waitForStartPage(60 * time.Second)
-	base := h.snap(r, "baseline", "start page loaded", h.sinceStartMs(), false)
+	base := h.snap(r, stepBaseline, "start page loaded", h.sinceStartMs(), false)
 	r.TopLevelInitial = len(base.Windows)
 
-	// Setup: sign in by keyboard (the user typing, not the extension) to reach /home and its rogue CRX link.
-	t0 := time.Now()
 	start := h.sinceStartMs()
-	h.press("Tab", "Tab")
-	h.typeString(demoUser)
-	h.press("Tab", "Tab")
-	h.typeString(demoPassword)
-	h.press("Enter", "Enter")
-	r.LoggedIn = h.waitForRequest("GET", "/home", t0, 10*time.Second)
-	if r.LoggedIn {
-		time.Sleep(1500 * time.Millisecond)
-		t1 := time.Now()
-		for i := 0; i < rogueTabStops; i++ {
-			h.press("Tab", "Tab")
-		}
-		h.press("Enter", "Enter")
-		r.RogueServed = h.waitForRequest("GET", "/rogue.crx", t1, 8*time.Second)
-		r.RogueVia = "Tab to #rogue-crx on /home + Enter"
-		time.Sleep(2 * time.Second)
-	}
-	h.snap(r, "rogue CRX install", "sign in by keyboard, then follow the /rogue.crx link", start, true)
+	h.signInAndFollowRogueLink(r)
+	h.snap(r, stepRogueCRX, "sign in by keyboard, then follow the /rogue.crx link", start, true)
 
 	step := func(item, action string, settle time.Duration, conformance bool, keys func()) *lockdownStep {
 		time.Sleep(700 * time.Millisecond)
@@ -174,34 +171,28 @@ func (h *harness) runLockdown() {
 		st.PreChunk = pre
 		return st
 	}
-	step("F12", "F12", 1500*time.Millisecond, true, func() { h.press("F12", "F12") })
+	step(stepF12, "F12", 1500*time.Millisecond, true, func() { h.press("F12", "F12") })
 	h.press("Escape", "Escape")
-	step("Ctrl+Shift+I", "ControlLeft+ShiftLeft+KeyI", 1500*time.Millisecond, true, func() { h.press("KeyI", "I", "ControlLeft", "ShiftLeft") })
+	step(stepDevTools, "ControlLeft+ShiftLeft+KeyI", 1500*time.Millisecond, true, func() { h.press("KeyI", "I", "ControlLeft", "ShiftLeft") })
 	h.press("Escape", "Escape")
-	step("Ctrl+P", "ControlLeft+KeyP", 2*time.Second, true, func() { h.press("KeyP", "p", "ControlLeft") })
+	step(stepPrint, "ControlLeft+KeyP", 2*time.Second, true, func() { h.press("KeyP", "p", "ControlLeft") })
 	// Park focus on a blank spot so a stray Enter cannot follow the focused link.
 	h.click([2]int{900, 600})
-	step("Ctrl+N escape window", "ControlLeft+KeyN", 2*time.Second, false, func() { h.press("KeyN", "n", "ControlLeft") })
+	step(stepNewWindow, "ControlLeft+KeyN", 2*time.Second, false, func() { h.press("KeyN", "n", "ControlLeft") })
 	// The watchdog closes the escape window within its 500 ms poll, so the URL goes in as one INPUT_INJECT batch
 	// right after Ctrl+N: the closed window's title in watchdog_closed shows what it was showing.
-	step("typed chrome://settings", "ControlLeft+KeyN, then one batch: ControlLeft+KeyL, chrome://settings, Enter", 2500*time.Millisecond, true, func() {
-		h.press("KeyN", "n", "ControlLeft")
-		time.Sleep(150 * time.Millisecond)
-		h.sendInput(append(append(comboEvents("KeyL", "l", "ControlLeft"), h.textEvents("chrome://settings")...),
-			comboEvents("Enter", "Enter")...)...)
+	step(stepSettings, "ControlLeft+KeyN, then one batch: ControlLeft+KeyL, chrome://settings, Enter", 2500*time.Millisecond, true, func() {
+		h.typeInNewWindow("chrome://settings")
 	})
 	if !r.RogueServed {
 		t2 := time.Now()
-		h.press("KeyN", "n", "ControlLeft")
-		time.Sleep(150 * time.Millisecond)
-		h.sendInput(append(append(comboEvents("KeyL", "l", "ControlLeft"), h.textEvents(rogueURL)...),
-			comboEvents("Enter", "Enter")...)...)
+		h.typeInNewWindow(rogueURL)
 		r.RogueServed = h.waitForRequest("GET", "/rogue.crx", t2, 8*time.Second)
 		r.RogueVia = "typed in a Ctrl+N window omnibox"
 		time.Sleep(2 * time.Second)
 	}
 	var early []windowInfo
-	tm := step("Shift+Esc Task Manager + watchdog", "ShiftLeft+Escape", 0, true, func() {
+	tm := step(stepTaskManager, "ShiftLeft+Escape", 0, true, func() {
 		h.press("Escape", "Escape", "ShiftLeft")
 		time.Sleep(400 * time.Millisecond)
 		early = topLevel(h.windows())
@@ -215,6 +206,36 @@ func (h *harness) runLockdown() {
 	r.ExtensionsDir = strings.TrimSpace(string(out))
 	out, _ = exec.Command("docker", "exec", h.runnerName(), "ls", "-la", "/quarantine").CombinedOutput()
 	r.Quarantine = strings.TrimSpace(string(out))
+}
+
+// The credentials are typed as the user would, not filled by the extension.
+func (h *harness) signInAndFollowRogueLink(r *lockdownRun) {
+	t0 := time.Now()
+	h.press("Tab", "Tab")
+	h.typeString(demoUser)
+	h.press("Tab", "Tab")
+	h.typeString(demoPassword)
+	h.press("Enter", "Enter")
+	r.LoggedIn = h.waitForRequest("GET", "/home", t0, 10*time.Second)
+	if !r.LoggedIn {
+		return
+	}
+	time.Sleep(1500 * time.Millisecond)
+	t1 := time.Now()
+	for i := 0; i < rogueTabStops; i++ {
+		h.press("Tab", "Tab")
+	}
+	h.press("Enter", "Enter")
+	r.RogueServed = h.waitForRequest("GET", "/rogue.crx", t1, 8*time.Second)
+	r.RogueVia = "Tab to #rogue-crx on /home + Enter"
+	time.Sleep(2 * time.Second)
+}
+
+func (h *harness) typeInNewWindow(text string) {
+	h.press("KeyN", "n", "ControlLeft")
+	time.Sleep(150 * time.Millisecond)
+	h.sendInput(append(append(comboEvents("KeyL", "l", "ControlLeft"), h.textEvents(text)...),
+		comboEvents("Enter", "Enter")...)...)
 }
 
 func (h *harness) eventsBetween(from, to int64) []json.RawMessage {
@@ -248,7 +269,7 @@ func extensionsOK(listing string) (bool, []string) {
 		}
 		rel := strings.TrimPrefix(line, profileExtensions+"/")
 		id, _, _ := strings.Cut(rel, "/")
-		if id != "Temp" && id != "lkjooopbmemjeafdccpphemkofjpfiao" && !contains(found, id) {
+		if id != "Temp" && id != infisicalExtensionID && !slices.Contains(found, id) {
 			found = append(found, id)
 		}
 	}
@@ -292,7 +313,6 @@ func readPNG(path string) (image.Image, error) {
 	return png.Decode(f)
 }
 
-// finishLockdown extracts the per-step frames from the live file and grades each item.
 func (h *harness) finishLockdown() {
 	h.mu.Lock()
 	r := h.lockdownRun
@@ -301,7 +321,7 @@ func (h *harness) finishLockdown() {
 		return
 	}
 	for i, st := range r.Steps {
-		slug := strings.Trim(regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(strings.ToLower(st.Item), "-"), "-")
+		slug := strings.Trim(slugRE.ReplaceAllString(strings.ToLower(st.Item), "-"), "-")
 		p := filepath.Join(r.EvidenceDir, fmt.Sprintf("%02d-%s.png", i, slug))
 		if st.Chunk >= 0 && h.extractFrame(st.Chunk, p) {
 			st.PNG = p
@@ -318,7 +338,7 @@ func (h *harness) finishLockdown() {
 		}
 	}
 	for _, e := range h.eventsBetween(0, -1) {
-		if k, _ := eventKind(e); k == "watchdog_closed" {
+		if k, _ := eventKind(e); k == eventWatchdogClosed {
 			r.WatchdogEvents++
 		}
 	}
@@ -327,7 +347,7 @@ func (h *harness) finishLockdown() {
 	for _, st := range r.Steps {
 		grade(r, st, prev, initial)
 		prev = st
-		if st.Item == "baseline" {
+		if st.Item == stepBaseline {
 			continue
 		}
 		fatal := st.conformance
@@ -342,7 +362,7 @@ func grade(r *lockdownRun, st, prev *lockdownStep, initial int) {
 	win := strings.Join(names(st.Windows), ", ")
 	watchdog := []string{}
 	for _, e := range st.Events {
-		if k, wm := eventKind(e); k == "watchdog_closed" {
+		if k, wm := eventKind(e); k == eventWatchdogClosed {
 			watchdog = append(watchdog, wm)
 		}
 	}
@@ -354,37 +374,37 @@ func grade(r *lockdownRun, st, prev *lockdownStep, initial int) {
 		st.Detail = fmt.Sprintf(detail, args...)
 	}
 	switch st.Item {
-	case "baseline":
+	case stepBaseline:
 		st.Result, st.Detail = "INFO", fmt.Sprintf("%d top-level windows: %s", n, win)
-	case "rogue CRX install":
+	case stepRogueCRX:
 		ok, extra := extensionsOK(r.ExtensionsDir)
 		if !r.RogueServed {
 			st.Result, st.Detail = "FAIL", fmt.Sprintf("inconclusive: /rogue.crx never requested (logged in %v)", r.LoggedIn)
 			return
 		}
 		pass(ok, "/rogue.crx fetched via %s; profile Extensions has no foreign id (found %v); windows: %s", r.RogueVia, extra, win)
-	case "F12", "Ctrl+Shift+I":
+	case stepF12, stepDevTools:
 		dev := windowNamed(st.Windows, "DevTools")
 		pass(!dev && n <= initial, "DevTools window %v, top-level windows %d (baseline %d): %s", dev, n, initial, win)
-	case "Ctrl+P":
+	case stepPrint:
 		printWin := windowNamed(st.Windows, "Print")
 		pass(!printWin && n <= initial && st.FrameDiff >= 0 && st.FrameDiff < 0.10,
 			"print window %v, top-level windows %d (baseline %d), frame change vs just before the keys %.1f%%",
 			printWin, n, initial, st.FrameDiff*100)
-	case "Ctrl+N escape window":
+	case stepNewWindow:
 		if n > len(prev.Windows) {
 			st.Result = "FAIL"
 			st.Detail = fmt.Sprintf("known kiosk escape (SPIKE F1): a second browser window is open (%s); pages stay policy-blocked; closed by the M3 extension guard or the watchdog", win)
 			return
 		}
 		pass(true, "no extra window remained (watchdog/guard events %v): %s", watchdog, win)
-	case "typed chrome://settings":
+	case stepSettings:
 		settings := windowNamed(st.Windows, "Settings")
 		for _, wm := range watchdog {
 			settings = settings || strings.Contains(strings.ToLower(wm), "settings -")
 		}
 		pass(!settings, "no window titled Settings; windows closed by the watchdog %v; windows: %s", watchdog, win)
-	case "Shift+Esc Task Manager + watchdog":
+	case stepTaskManager:
 		early := windowNamed(st.EarlyWindows, "Task Manager")
 		late := windowNamed(st.Windows, "Task Manager")
 		closed := false

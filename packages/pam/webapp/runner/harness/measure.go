@@ -82,7 +82,6 @@ func percentile(xs []float64, p float64) float64 {
 	return s[i]
 }
 
-// runMeasure scrolls the /input scroller continuously and samples docker stats for the runner every 2 s.
 func (h *harness) runMeasure() {
 	if h.o.lockdown {
 		return
@@ -93,23 +92,7 @@ func (h *harness) runMeasure() {
 		Motion: "wheel dy=+/-120 px every 50 ms on #scroller of /input, direction flips every 20 events"}
 	stop := make(chan struct{})
 	done := make(chan int)
-	go func() {
-		n, dir := 0, 1.0
-		for {
-			select {
-			case <-stop:
-				done <- n
-				return
-			default:
-			}
-			h.sendInput(contract.InputEvent{T: "wheel", DY: 120 * dir, X: scrollerPoint[0], Y: scrollerPoint[1], Ts: h.ts()})
-			n++
-			if n%20 == 0 {
-				dir = -dir
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}()
+	go func() { done <- h.scrollUntil(stop) }()
 	chunks0 := h.chunkCount()
 	begin := time.Now()
 	tick := time.NewTicker(2 * time.Second)
@@ -127,6 +110,33 @@ func (h *harness) runMeasure() {
 	close(stop)
 	res.WheelEvents = <-done
 	res.LiveChunks = h.chunkCount() - chunks0
+	res.summarize()
+	h.mu.Lock()
+	h.measureRes = res
+	h.mu.Unlock()
+	h.addCheck("measure: docker stats sampled", len(res.Samples) >= h.o.measure/3, false,
+		"%d samples over %ds: CPU mean %.2f p95 %.2f cores, RAM mean %.0f max %.0f MiB (%s live)",
+		len(res.Samples), h.o.measure, res.MeanCores, res.P95Cores, res.MeanMiB, res.MaxMiB, h.o.codec)
+}
+
+func (h *harness) scrollUntil(stop <-chan struct{}) int {
+	n, dir := 0, 1.0
+	for {
+		select {
+		case <-stop:
+			return n
+		default:
+		}
+		h.sendInput(contract.InputEvent{T: "wheel", DY: 120 * dir, X: scrollerPoint[0], Y: scrollerPoint[1], Ts: h.ts()})
+		n++
+		if n%20 == 0 {
+			dir = -dir
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (res *measureResult) summarize() {
 	var cpu []float64
 	for _, s := range res.Samples {
 		cpu = append(cpu, s.CPUCores)
@@ -140,12 +150,6 @@ func (h *harness) runMeasure() {
 		res.MeanMiB /= n
 	}
 	res.P95Cores = percentile(cpu, 0.95)
-	h.mu.Lock()
-	h.measureRes = res
-	h.mu.Unlock()
-	h.addCheck("measure: docker stats sampled", len(res.Samples) >= h.o.measure/3, false,
-		"%d samples over %ds: CPU mean %.2f p95 %.2f cores, RAM mean %.0f max %.0f MiB (%s live)",
-		len(res.Samples), h.o.measure, res.MeanCores, res.P95Cores, res.MeanMiB, res.MaxMiB, h.o.codec)
 }
 
 func (h *harness) writeMeasure() {

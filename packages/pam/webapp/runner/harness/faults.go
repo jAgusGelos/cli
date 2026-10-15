@@ -2,6 +2,7 @@ package main
 
 import (
 	"os/exec"
+	"slices"
 	"time"
 )
 
@@ -33,7 +34,6 @@ func (h *harness) stallXvfb() {
 	time.Sleep(8 * time.Second)
 }
 
-// reconnectAgent drops the agent link, accepts the re-dial, welcomes it and restarts live video.
 func (h *harness) reconnectAgent(links <-chan authed, ends chan linkEnd) {
 	time.Sleep(3 * time.Second)
 	h.mu.Lock()
@@ -43,10 +43,7 @@ func (h *harness) reconnectAgent(links <-chan authed, ends chan linkEnd) {
 	for _, s := range h.segs {
 		maxBefore = max(maxBefore, s.Meta.SegmentIndex)
 	}
-	epochBefore := 0
-	if n := len(h.videoConfigs); n > 0 {
-		epochBefore = h.videoConfigs[n-1].Epoch
-	}
+	epochBefore := h.lastEpochLocked()
 	hellosBefore := len(h.hellos)
 	h.mu.Unlock()
 	closedAt := time.Now()
@@ -78,14 +75,11 @@ func (h *harness) finishFaults() {
 	h.mu.Lock()
 	stall, hasStall := h.faults["stall"]
 	rec, hasRec := h.faults["reconnect"].(map[string]any)
-	losses := append(h.losses[:0:0], h.losses...)
-	segs := append([]segInfo(nil), h.segs...)
+	losses := slices.Clone(h.losses)
+	segs := slices.Clone(h.segs)
 	configs := len(h.videoConfigs)
-	var newEpoch int
-	if configs > 0 {
-		newEpoch = h.videoConfigs[configs-1].Epoch
-	}
-	chunks := append([]chunkInfo(nil), h.chunks...)
+	newEpoch := h.lastEpochLocked()
+	chunks := slices.Clone(h.chunks)
 	h.mu.Unlock()
 
 	count := func(reason string) int {

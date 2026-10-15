@@ -23,7 +23,6 @@ func livePath(out, codec string) string {
 	return filepath.Join(out, "live.h264")
 }
 
-// ffmpegInput returns the input arguments for the live file.
 func ffmpegInput(out, codec string) []string {
 	if codec == "vp9" {
 		return []string{"-f", "ivf", "-i", livePath(out, codec)}
