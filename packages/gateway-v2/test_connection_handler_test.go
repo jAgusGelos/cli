@@ -1,7 +1,12 @@
 package gatewayv2
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -51,6 +56,28 @@ func TestClickhouseTestParamsContract(t *testing.T) {
 			require.NotNil(t, params.SslRejectUnauthorized)
 		})
 	}
+}
+
+func TestWebAppConnectionTest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "Bearer token", r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(parsed.Port())
+	require.NoError(t, err)
+	require.NoError(t, doWebAppConnectionTest(context.Background(), rpcTarget{host: parsed.Hostname(), port: port}, webAppTestParams{
+		URL: server.URL, AllowedHosts: []string{parsed.Hostname()}, AuthMethod: "header", HeaderScheme: "bearer", Token: "token",
+	}))
+}
+
+func TestWebAppConnectionTestRejectsTargetMismatch(t *testing.T) {
+	err := doWebAppConnectionTest(context.Background(), rpcTarget{host: "signed.example", port: 80}, webAppTestParams{
+		URL: "http://other.example/", AllowedHosts: []string{"other.example"}, AuthMethod: "none",
+	})
+	require.EqualError(t, err, "URL host does not match the signed target")
 }
 
 func TestRPCTargetAllows(t *testing.T) {
