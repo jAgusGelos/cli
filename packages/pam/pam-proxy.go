@@ -29,6 +29,7 @@ import (
 	"github.com/Infisical/infisical-merge/packages/pam/handlers/ssh"
 	"github.com/Infisical/infisical-merge/packages/pam/session"
 	"github.com/Infisical/infisical-merge/packages/pam/session/masking"
+	"github.com/Infisical/infisical-merge/packages/pam/webapp"
 	"github.com/Infisical/infisical-merge/packages/util"
 	"github.com/go-resty/resty/v2"
 	"github.com/rs/zerolog/log"
@@ -46,6 +47,25 @@ type GatewayPAMConfig struct {
 	SessionUploader    *session.SessionUploader
 	GetMongoProxy      MongoProxyGetter // Session-level MongoDB proxy sharing
 	OnActivity         func()           // Called on data flow
+	WebApp             *webapp.Service  // Web App sessions (nil when the gateway runs without them)
+}
+
+// PAMProxyMode selects the flow HandlePAMProxy runs for the negotiated ALPN.
+type PAMProxyMode int
+
+const (
+	PAMProxyModeDefault    PAMProxyMode = iota // infisical-pam-proxy
+	PAMProxyModeRDPBrowser                     // infisical-pam-rdp-browser: RDCleanPath over the inbound stream
+	PAMProxyModeWebApp                         // infisical-pam-web-app: remote browser session
+)
+
+// ValidatePAMProxyMode rejects a web-app resource on any ALPN but the web-app one, and any other resource on it.
+func ValidatePAMProxyMode(mode PAMProxyMode, resourceType string) error {
+	isWebApp := resourceType == session.ResourceTypeWebApp
+	if isWebApp != (mode == PAMProxyModeWebApp) {
+		return fmt.Errorf("resource type %q is not allowed on this PAM mode", resourceType)
+	}
+	return nil
 }
 
 type PAMCapabilitiesResponse struct {
@@ -67,6 +87,7 @@ func GetSupportedResourceTypes() []string {
 		session.ResourceTypeAzureCli,
 		session.ResourceTypeSnowflake,
 		session.ResourceTypeClickhouse,
+		session.ResourceTypeWebApp,
 	}
 	// Only advertise RDP when the real bridge is compiled in. A stub
 	// build would otherwise accept RDP session routing and fail every
@@ -205,10 +226,13 @@ func compilePolicyPatterns(patterns []string, sessionID string, ruleType string)
 	return compiled
 }
 
-// HandlePAMProxy handles a PAM session connection. `browserRDP` selects
-// the browser RDP flow (RDCleanPath over the inbound stream) when the
-// resource is Windows; ignored for other resource types.
-func HandlePAMProxy(ctx context.Context, conn *tls.Conn, pamConfig *GatewayPAMConfig, httpClient *resty.Client, browserRDP bool) error {
+// HandlePAMProxy handles a PAM session connection. `mode` comes from the ALPN: PAMProxyModeRDPBrowser selects the
+// browser RDP flow when the resource is Windows, PAMProxyModeWebApp is required for (and only for) web-app resources.
+func HandlePAMProxy(ctx context.Context, conn *tls.Conn, pamConfig *GatewayPAMConfig, httpClient *resty.Client, mode PAMProxyMode) error {
+	if err := ValidatePAMProxyMode(mode, pamConfig.ResourceType); err != nil {
+		return err
+	}
+	browserRDP := mode == PAMProxyModeRDPBrowser
 	credentialExpiryTime := pamConfig.ExpiryTime
 	if pamConfig.ResourceType == session.ResourceTypeGcpServiceAccount ||
 		pamConfig.ResourceType == session.ResourceTypeAzureCli {
@@ -254,6 +278,12 @@ func HandlePAMProxy(ctx context.Context, conn *tls.Conn, pamConfig *GatewayPAMCo
 			conn.Close()
 		}
 	}()
+
+	// Web App sessions record through their own signed recorder: return before the legacy session logger and
+	// uploader, so no legacy .enc recording is created for them.
+	if pamConfig.ResourceType == session.ResourceTypeWebApp {
+		return handleWebAppSession(ctx, conn, pamConfig, credentials)
+	}
 
 	encryptionKey, err := pamConfig.CredentialsManager.GetPAMSessionEncryptionKey()
 	if err != nil {
@@ -640,4 +670,18 @@ func HandlePAMProxy(ctx context.Context, conn *tls.Conn, pamConfig *GatewayPAMCo
 	default:
 		return fmt.Errorf("unsupported resource type: %s", pamConfig.ResourceType)
 	}
+}
+
+func handleWebAppSession(ctx context.Context, conn net.Conn, pamConfig *GatewayPAMConfig, credentials *session.PAMCredentials) error {
+	if pamConfig.WebApp == nil {
+		return fmt.Errorf("web app sessions are not enabled on this gateway")
+	}
+	log.Info().Str("sessionId", pamConfig.SessionId).Msg("Starting Web App PAM session")
+	return pamConfig.WebApp.HandleSession(ctx, conn, webapp.SessionParams{
+		SessionID:   pamConfig.SessionId,
+		ExpiresAt:   pamConfig.ExpiryTime,
+		Credentials: credentials,
+		Recording:   pamConfig.CredentialsManager.GetRecordingSecrets(pamConfig.SessionId),
+		OnActivity:  pamConfig.OnActivity,
+	})
 }

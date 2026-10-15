@@ -972,6 +972,7 @@ type PAMSessionCredentialsResponse struct {
 	Credentials PAMSessionCredentials `json:"credentials"`
 	PolicyRules *PAMPolicyRules       `json:"policyRules,omitempty"`
 	Recording   *PAMRecordingResponse `json:"recording,omitempty"`
+	AccountId   string                `json:"accountId,omitempty"`
 }
 
 type PAMRecordingResponse struct {
@@ -1037,6 +1038,49 @@ type PAMSessionCredentials struct {
 	Schema                string            `json:"schema,omitempty"`
 	Role                  string            `json:"role,omitempty"`
 	PrivateKeyPassphrase  string            `json:"privateKeyPassphrase,omitempty"`
+	WebApp                *PAMWebAppDetails `json:"webApp,omitempty"`
+}
+
+// PAMWebAppDetails carries a Web App account's connection details, credentials and template settings
+// (INF-WEBAPP CONTRACTS.md 8.1, 8.3).
+type PAMWebAppDetails struct {
+	ConnectionDetails PAMWebAppConnectionDetails `json:"connectionDetails"`
+	Credentials       PAMWebAppCredentials       `json:"credentials"`
+	Settings          *PAMWebAppSettings         `json:"settings,omitempty"`
+}
+
+type PAMWebAppConnectionDetails struct {
+	URL                   string   `json:"url"`
+	AllowedHosts          []string `json:"allowedHosts"`
+	SSLRejectUnauthorized *bool    `json:"sslRejectUnauthorized,omitempty"`
+	SSLCertificate        string   `json:"sslCertificate,omitempty"`
+}
+
+type PAMWebAppCredentials struct {
+	AuthMethod   string                 `json:"authMethod"` // none | header | form-login
+	HeaderScheme string                 `json:"headerScheme,omitempty"`
+	Username     string                 `json:"username,omitempty"`
+	Password     string                 `json:"password,omitempty"`
+	Token        string                 `json:"token,omitempty"`
+	HeaderName   string                 `json:"headerName,omitempty"`
+	HeaderValue  string                 `json:"headerValue,omitempty"`
+	Recipe       map[string]interface{} `json:"recipe,omitempty"`
+}
+
+// PAMWebAppSettings mirrors the template webApp object; absent fields take the contract defaults.
+type PAMWebAppSettings struct {
+	RequireObjectLock  *bool    `json:"requireObjectLock,omitempty"`
+	OnRecorderOverflow string   `json:"onRecorderOverflow,omitempty"`
+	MaskedSelectors    []string `json:"maskedSelectors,omitempty"`
+	MaskedHeaders      []string `json:"maskedHeaders,omitempty"`
+	MaskedQueryParams  []string `json:"maskedQueryParams,omitempty"`
+	BodyCapBytes       *int     `json:"bodyCapBytes,omitempty"`
+	RetentionDays      *int     `json:"retentionDays,omitempty"`
+	Clipboard          string   `json:"clipboard,omitempty"`
+	Downloads          string   `json:"downloads,omitempty"`
+	Uploads            string   `json:"uploads,omitempty"`
+	IdleTimeoutMinutes *int     `json:"idleTimeoutMinutes,omitempty"`
+	LiveCodecs         []string `json:"liveCodecs,omitempty"`
 }
 
 type MFASessionStatus string
