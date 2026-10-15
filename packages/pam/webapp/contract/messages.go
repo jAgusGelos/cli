@@ -63,20 +63,32 @@ const (
 
 // ControlDown is the CONTROL payload; only the fields of its kind are set.
 type ControlDown struct {
-	Kind          string `json:"kind"`
-	SessionID     string `json:"sessionId,omitempty"`
-	ExpiresAt     string `json:"expiresAt,omitempty"`
-	InputEnabled  *bool  `json:"inputEnabled,omitempty"`
-	Reason        string `json:"reason,omitempty"`
-	Enabled       *bool  `json:"enabled,omitempty"`
-	SecondsLeft   *int   `json:"secondsLeft,omitempty"`
-	Message       string `json:"message,omitempty"`
-	Active        *bool  `json:"active,omitempty"`
-	DroppedFrames *int   `json:"droppedFrames,omitempty"`
-	State         string `json:"state,omitempty"`
-	LostMs        *int64 `json:"lostMs,omitempty"`
-	Code          string `json:"code,omitempty"`
-	Fatal         *bool  `json:"fatal,omitempty"`
+	Kind          string         `json:"kind"`
+	SessionID     string         `json:"sessionId,omitempty"`
+	ExpiresAt     string         `json:"expiresAt,omitempty"`
+	InputEnabled  *bool          `json:"inputEnabled,omitempty"`
+	Reason        string         `json:"reason,omitempty"`
+	Enabled       *bool          `json:"enabled,omitempty"`
+	SecondsLeft   *int           `json:"secondsLeft,omitempty"`
+	Message       string         `json:"message,omitempty"`
+	Active        *bool          `json:"active,omitempty"`
+	DroppedFrames *int           `json:"droppedFrames,omitempty"`
+	State         string         `json:"state,omitempty"`
+	LostMs        *int64         `json:"lostMs,omitempty"`
+	Code          string         `json:"code,omitempty"`
+	Fatal         *bool          `json:"fatal,omitempty"`
+	Policy        *SessionPolicy `json:"policy,omitempty"`
+}
+
+type SessionPolicy struct {
+	Clipboard string `json:"clipboard"` // off | to_remote | from_remote | both
+	Downloads string `json:"downloads"` // block | quarantine | allow
+	Uploads   string `json:"uploads"`   // block | allow
+}
+
+// MonoFromPts maps a recording PTS onto the session monotonic clock (CONTRACTS.md 5.2, v1.1).
+func MonoFromPts(ptsZeroUnixMs, sessionOpenWallTimeUnixMs, ptsUs int64) int64 {
+	return (ptsZeroUnixMs-sessionOpenWallTimeUnixMs)*1000 + ptsUs
 }
 
 // Error codes carried by CONTROL error.
@@ -88,6 +100,7 @@ const (
 	ErrCodeCapacity          = "capacity_exhausted"
 	ErrCodeLoginFailed       = "login_failed"
 	ErrCodeTunnelFailed      = "tunnel_failed"
+	ErrCodeSessionInUse      = "session_in_use"
 	ErrCodeInternal          = "internal"
 )
 
@@ -153,11 +166,12 @@ type AgentWelcome struct {
 }
 
 type RecInitMeta struct {
-	Codec     string `json:"codec"`
-	Mime      string `json:"mime"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	Timescale int    `json:"timescale"`
+	Codec         string `json:"codec"`
+	Mime          string `json:"mime"`
+	Width         int    `json:"width"`
+	Height        int    `json:"height"`
+	Timescale     int    `json:"timescale"`
+	PtsZeroUnixMs int64  `json:"ptsZeroUnixMs"`
 }
 
 type RecSegmentMeta struct {

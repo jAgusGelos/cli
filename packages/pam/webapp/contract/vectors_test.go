@@ -368,6 +368,10 @@ func TestFrameLimits(t *testing.T) {
 	require.Equal(t, "body", string(body))
 }
 
+func TestMonoFromPts(t *testing.T) {
+	require.Equal(t, int64(61250000), MonoFromPts(1760545801250, 1760545800000, 60000000))
+}
+
 func TestChooseLiveCodec(t *testing.T) {
 	var h ViewerHello
 	h.Decoders.VP9, h.Decoders.H264 = true, true
