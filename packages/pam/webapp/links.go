@@ -29,7 +29,7 @@ func (a *agentLink) send(t contract.FrameType, payload []byte) error {
 	defer a.mu.Unlock()
 	f := &contract.Frame{Type: t, Seq: a.seq, TimestampUs: uint64(time.Since(a.start).Microseconds()), Payload: payload}
 	a.seq++
-	_ = a.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_ = a.conn.SetWriteDeadline(time.Now().Add(linkWriteTimeout))
 	return contract.WriteFrame(a.conn, f)
 }
 
@@ -45,7 +45,7 @@ func (a *agentLink) welcome() error {
 	w := contract.AgentWelcome{OK: true}
 	w.Recording = &struct {
 		SegmentSeconds int `json:"segmentSeconds"`
-	}{SegmentSeconds: 10}
+	}{SegmentSeconds: defaultRecording.SegmentSeconds}
 	return a.sendJSON(contract.FrameAgentWelcome, w)
 }
 
@@ -80,7 +80,7 @@ func newViewerLink(c net.Conn) *viewerLink {
 func (v *viewerLink) writer() {
 	defer close(v.drained)
 	for b := range v.out {
-		_ = v.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_ = v.conn.SetWriteDeadline(time.Now().Add(linkWriteTimeout))
 		if _, err := v.conn.Write(b); err != nil {
 			v.kill()
 			for range v.out {
@@ -98,7 +98,7 @@ func (v *viewerLink) kill() {
 }
 
 // enqueue assigns the next seq and queues the frame. droppable frames are refused when the queue is full; others wait
-// up to 5 s, then the link is considered dead.
+// up to viewerEnqueueWait, then the link is considered dead.
 func (v *viewerLink) enqueue(f *contract.Frame, droppable bool) (uint32, bool) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -126,7 +126,7 @@ func (v *viewerLink) enqueue(f *contract.Frame, droppable bool) (uint32, bool) {
 		case v.out <- b:
 		case <-v.dead:
 			return 0, false
-		case <-time.After(5 * time.Second):
+		case <-time.After(viewerEnqueueWait):
 			go v.kill()
 			return 0, false
 		}
@@ -146,6 +146,11 @@ func (v *viewerLink) control(c contract.ControlDown) bool {
 
 func (v *viewerLink) controlError(code, msg string, fatal bool) bool {
 	return v.control(contract.ControlDown{Kind: contract.ControlError, Code: code, Message: msg, Fatal: &fatal})
+}
+
+// fatalError sends a fatal CONTROL error whose message is its code.
+func (v *viewerLink) fatalError(code string) bool {
+	return v.controlError(code, code, true)
 }
 
 // close flushes queued frames for at most wait, then closes the connection.
