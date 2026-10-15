@@ -124,6 +124,8 @@ type liveSession struct {
 	log   zerolog.Logger
 	rec   *recorder.Recorder
 	input *inputPath
+	focus *secretFocus
+	l3    *l3Queue
 
 	ready   chan struct{} // closed once the session is ready for a viewer
 	endOnce sync.Once
@@ -257,7 +259,8 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 	}
 
 	ls := &liveSession{svc: s, p: p, cfg: cfg, log: l, endCh: make(chan struct{}), ready: make(chan struct{}), endReason: endError,
-		input: newInputPath(defaultDisplay.Width, defaultDisplay.Height)}
+		input: newInputPath(defaultDisplay.Width, defaultDisplay.Height), focus: newSecretFocus()}
+	ls.l3 = newL3Queue(ls.focus, func(body *l3Input, arrival time.Time) { ls.recordAt(contract.EventL3Input, body, arrival) })
 	s.mu.Lock()
 	if s.live[p.SessionID] != nil {
 		s.mu.Unlock()
@@ -334,6 +337,7 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 		return fail(contract.ErrCodeInternal, err)
 	}
 	defer func() {
+		ls.l3.flush()
 		cctx, cancel := context.WithTimeout(context.Background(), recorderCloseTimeout)
 		defer cancel()
 		if err := rec.Close(cctx, ls.reason()); err != nil {
@@ -714,7 +718,7 @@ func (ls *liveSession) releaseHeld() {
 			ls.log.Debug().Err(err).Msg("Web App: release injection failed")
 		}
 	}
-	ls.record(contract.EventL3Input, &l3Input{Events: toL3(rel, true), Dropped: []droppedEntry{}})
+	ls.l3.push(&l3Input{Events: toL3(rel, true), Dropped: []droppedEntry{}}, time.Now())
 }
 
 func shortID(id string) string {
@@ -789,7 +793,7 @@ func (ls *liveSession) readViewer(vl *viewerLink) {
 				return
 			}
 		case contract.FrameClipboardUp:
-			ls.recordAt(contract.EventL3Input, clipboardBlocked(len(f.Payload), f.Seq), arrival)
+			ls.l3.push(clipboardBlocked(len(f.Payload), f.Seq), arrival)
 		}
 	}
 }
@@ -817,7 +821,7 @@ func (ls *liveSession) handleControlUp(payload []byte) bool {
 func (ls *liveSession) handleInput(vl *viewerLink, f *contract.Frame, arrival time.Time) {
 	kept, rec, tooMany, err := ls.input.process(f.Payload, f.Seq, arrival)
 	if rec != nil {
-		ls.recordAt(contract.EventL3Input, rec, arrival)
+		ls.l3.push(rec, arrival)
 	}
 	if err != nil {
 		vl.controlError(contract.ErrCodeProtocol, "malformed INPUT frame", false)

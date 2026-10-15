@@ -197,6 +197,7 @@ func (ls *liveSession) readAgent(a *agentLink) {
 			var ev contract.AgentEvent
 			if json.Unmarshal(f.Payload, &ev) == nil {
 				ls.log.Debug().Str("kind", ev.Kind).Msg("Web App agent event")
+				ls.focus.apply(ev, time.Now())
 			}
 		}
 	}
