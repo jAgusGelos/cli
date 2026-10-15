@@ -12,8 +12,14 @@ chrome.runtime.onMessage.addListener((message) => {
   }
   if (message.type !== 'form_login') return;
   const recipe = message.recipe || {};
-  if (recipe.loginUrl && !location.href.startsWith(recipe.loginUrl)) {
-    return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: false, reason: 'success_check_failed', url: location.href});
+  if (recipe.loginUrl) {
+    try {
+      const target = new URL(recipe.loginUrl); const current = new URL(location.href);
+      if (target.origin !== current.origin || !current.pathname.startsWith(target.pathname))
+        return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: false, reason: 'success_check_failed', url: location.href});
+    } catch (_) {
+      return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: false, reason: 'success_check_failed', url: location.href});
+    }
   }
   const user = document.querySelector(recipe.usernameSelector);
   const pass = document.querySelector(recipe.passwordSelector);

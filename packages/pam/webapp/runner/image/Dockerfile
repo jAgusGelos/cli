@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       fonts-dejavu-core x11-utils openssl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 1000 -m -d /home/rbi rbi \
-    && mkdir -p /etc/chromium/policies /opt/iwa/policies /quarantine \
+    && mkdir -p /etc/chromium/policies /etc/chromium/native-messaging-hosts /opt/iwa/policies /quarantine \
     && rm -rf /etc/chromium/policies/managed /etc/chromium/policies/recommended \
     && ln -s /tmp/iwa/policies /etc/chromium/policies/managed
 COPY policies/rbi.json /opt/iwa/policies/rbi.json
