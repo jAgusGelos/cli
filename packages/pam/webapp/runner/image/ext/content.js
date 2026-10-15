@@ -7,12 +7,23 @@ chrome.runtime.sendMessage({type: 'page', url: location.href, title: document.ti
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type !== 'form_login') return;
   const recipe = message.recipe || {};
-  const user = document.querySelector(recipe.username || recipe.user);
-  const pass = document.querySelector(recipe.password || recipe.pass);
-  const submit = document.querySelector(recipe.submit);
+  const user = document.querySelector(recipe.usernameSelector);
+  const pass = document.querySelector(recipe.passwordSelector);
+  const submit = document.querySelector(recipe.submitSelector);
   if (!user || !pass || !submit) return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: false, reason: 'selector_not_found', url: location.href});
   setValue(user, message.username || ''); setValue(pass, message.password || '');
   chrome.runtime.sendMessage({type: 'credential_injected', requestId: message.requestId, fields: ['username', 'password'], url: location.href});
   submit.click();
-  setTimeout(() => chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: true, reason: 'success_check_passed', url: location.href}), 500);
+  const timeout = Math.min(Math.max(Number(message.timeoutMs || 15000), 100), 30000);
+  const check = recipe.successCheck || {};
+  const deadline = Date.now() + timeout;
+  const poll = () => {
+    let ok = false;
+    if (check.type === 'selector_present') ok = Boolean(document.querySelector(check.value));
+    else if (check.type === 'url_matches') ok = new RegExp(check.value || '').test(location.href);
+    if (ok) return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: true, reason: 'success_check_passed', url: location.href});
+    if (Date.now() >= deadline) return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: false, reason: 'timeout', url: location.href});
+    setTimeout(poll, 250);
+  };
+  setTimeout(poll, 250);
 });

@@ -5,11 +5,21 @@ import json, os, socket, struct, sys, threading
 SOCKET = "/tmp/iwa/native.sock"
 
 def read_message(stream):
-    header = stream.read(4)
+    if isinstance(stream, socket.socket):
+        header = stream.recv(4)
+    else:
+        header = stream.read(4)
     if len(header) != 4: return None
     size = struct.unpack("<I", header)[0]
     if size > 4 * 1024 * 1024: raise ValueError("native message too large")
-    data = stream.read(size)
+    if isinstance(stream, socket.socket):
+        data = b""
+        while len(data) < size:
+            part = stream.recv(size - len(data))
+            if not part: return None
+            data += part
+    else:
+        data = stream.read(size)
     if len(data) != size: return None
     return json.loads(data.decode())
 
@@ -32,7 +42,10 @@ def main():
         def forward_to_chrome():
             try:
                 while not stop.is_set():
-                    message = read_message(sock)
+                    try:
+                        message = read_message(sock)
+                    except socket.timeout:
+                        continue
                     if message is None: break
                     write_message(sys.stdout.buffer, message)
             finally: stop.set()
