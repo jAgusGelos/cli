@@ -73,6 +73,30 @@ func TestWebAppConnectionTest(t *testing.T) {
 	}))
 }
 
+func TestWebAppConnectionTestUsesHostsOverride(t *testing.T) {
+	gotHost := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost <- r.Host
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(parsed.Port())
+	require.NoError(t, err)
+	appURL := "http://app.corp.internal:" + parsed.Port() + "/"
+	target := rpcTarget{host: "app.corp.internal", port: port}
+	params := webAppTestParams{URL: appURL, AllowedHosts: []string{"app.corp.internal"}, AuthMethod: "none"}
+
+	t.Setenv("INFISICAL_WEBAPP_HOSTS_OVERRIDE", "app.corp.internal="+parsed.Hostname())
+	require.NoError(t, doWebAppConnectionTest(context.Background(), target, params))
+	// The probe dials the override address but still addresses the app by name.
+	require.Equal(t, "app.corp.internal:"+parsed.Port(), <-gotHost)
+
+	t.Setenv("INFISICAL_WEBAPP_HOSTS_OVERRIDE", "app.corp.internal")
+	require.ErrorContains(t, doWebAppConnectionTest(context.Background(), target, params), "INFISICAL_WEBAPP_HOSTS_OVERRIDE")
+}
+
 func TestWebAppConnectionTestRejectsTargetMismatch(t *testing.T) {
 	err := doWebAppConnectionTest(context.Background(), rpcTarget{host: "signed.example", port: 80}, webAppTestParams{
 		URL: "http://other.example/", AllowedHosts: []string{"other.example"}, AuthMethod: "none",
