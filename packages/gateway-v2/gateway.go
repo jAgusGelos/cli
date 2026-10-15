@@ -144,7 +144,7 @@ type Gateway struct {
 	// PAM session uploader
 	pamSessionUploader *session.SessionUploader
 
-	// Web App sessions (nil when the recording key cannot be loaded)
+	// Web App sessions (nil when the service could not be set up)
 	webApp *webapp.Service
 
 	// mTLS server components
@@ -214,8 +214,7 @@ func NewGateway(config *GatewayConfig) (*Gateway, error) {
 	webAppCfg.BackendURL = infisicalconfig.INFISICAL_URL
 	webAppService, err := webapp.NewService(webAppCfg, httpClient)
 	if err != nil {
-		log.Warn().Err(err).Msg("Web App sessions disabled: recording key unavailable")
-		webAppService = nil
+		log.Warn().Err(err).Msg("Web App sessions disabled: service setup failed")
 	}
 
 	return &Gateway{
