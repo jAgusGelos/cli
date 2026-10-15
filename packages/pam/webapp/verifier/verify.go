@@ -1,13 +1,12 @@
 package verifier
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -17,40 +16,33 @@ import (
 
 const fingerprintPrefix = "SHA256:"
 
-type chainEvent struct {
-	envelope contract.Envelope
-	hash     [32]byte
-}
-
 type checkedObject struct {
-	entry      ObjectEntry
 	checkpoint *contract.Checkpoint
-	// plaintext is nil when the object could not be decrypted (no session key, or a failed check already reported).
+	// plaintext is kept for event chunks only, and is nil when the chunk could not be decrypted.
 	plaintext []byte
 }
 
 type verification struct {
-	bundle       *Bundle
-	report       *Report
-	recordingPub ed25519.PublicKey
-	sessionPub   ed25519.PublicKey
-	keyCert      *contract.KeyCert
-	events       map[uint64]chainEvent
-	maxSeq       uint64
-	ended        bool
-	videoLoss    bool
-	// eventsComplete is false when an event chunk could not be decrypted: end-record and binding conclusions would
-	// then only repeat the failure already reported, so they are skipped.
+	bundle         *Bundle
+	report         *Report
+	recordingPub   ed25519.PublicKey
+	sessionPub     ed25519.PublicKey
+	keyCert        *contract.KeyCert
+	events         map[uint64]chainEvent
+	seqs           []uint64
 	eventsComplete bool
+	chainGap       bool
+	ended          bool
+	videoLossCount int64
 }
 
-// Verify checks the bundle against the customer-recorded recording key fingerprint and returns the verdict with
-// every finding. It never trusts a key from the bundle that does not chain to that fingerprint.
+// Verify checks the bundle against the customer-recorded recording key fingerprint (CONTRACTS.md 6.11). It never
+// trusts a key from the bundle that does not chain to that fingerprint.
 func Verify(b *Bundle, trustedFingerprint string) *Report {
 	v := &verification{
 		bundle: b,
 		report: &Report{
-			Fingerprint: NormalizeFingerprint(trustedFingerprint),
+			Fingerprint: normalizeFingerprint(trustedFingerprint),
 			SessionID:   b.Replay.SessionID,
 			ProjectID:   b.Replay.ProjectID,
 		},
@@ -62,7 +54,7 @@ func Verify(b *Bundle, trustedFingerprint string) *Report {
 		v.report.EventChunks, v.report.VideoObjects = len(chunks), len(videos)
 		v.verifyChain(chunks)
 		if v.eventsComplete {
-			v.verifyLifecycle()
+			v.verifyLifecycle(len(chunks), len(videos))
 			v.verifyVideoBinding(videos)
 		}
 	}
@@ -70,7 +62,7 @@ func Verify(b *Bundle, trustedFingerprint string) *Report {
 	return v.report
 }
 
-func NormalizeFingerprint(fingerprint string) string {
+func normalizeFingerprint(fingerprint string) string {
 	trimmed := strings.TrimSpace(fingerprint)
 	if strings.HasPrefix(trimmed, fingerprintPrefix) {
 		return trimmed
@@ -90,6 +82,7 @@ func (v *verification) verifyKeys() bool {
 		v.report.tampered("keys", "recording key fingerprint %s does not match the trusted fingerprint", got)
 		return false
 	}
+	v.checkAdvertisedKey()
 	sessionID, err := uuid.Parse(replay.SessionID)
 	if err != nil {
 		v.report.tampered("keys", "sessionId %q is not a UUID", replay.SessionID)
@@ -110,6 +103,18 @@ func (v *verification) verifyKeys() bool {
 		v.report.incomplete("keys", "no %s in the bundle: chain and plaintext digests not verified", SessionKeyFile)
 	}
 	return true
+}
+
+// checkAdvertisedKey compares the fingerprint and key id that replay.json displays with the verified key, so a
+// bundle cannot show a reader a different fingerprint than the one it was checked against.
+func (v *verification) checkAdvertisedKey() {
+	advertised := v.bundle.Replay.RecordingKey
+	if advertised.Fingerprint != "" && advertised.Fingerprint != v.report.Fingerprint {
+		v.report.tampered("keys", "replay.json advertises fingerprint %s", advertised.Fingerprint)
+	}
+	if advertised.KeyID != "" && advertised.KeyID != contract.KeyIDHex(v.recordingPub) {
+		v.report.tampered("keys", "replay.json advertises key id %s", advertised.KeyID)
+	}
 }
 
 func verifyKeyCert(recordingPub ed25519.PublicKey, keyCertB64, sigB64 string) (*contract.KeyCert, error) {
@@ -144,8 +149,7 @@ func objectSubject(series contract.Series, objectIndex uint32) string {
 	return fmt.Sprintf("%s/%d", series.Letter(), objectIndex)
 }
 
-// checkObject verifies one checkpoint and its stored object. It returns false when the checkpoint itself cannot be
-// trusted, so later stages never use its fields.
+// checkObject returns false when the checkpoint itself cannot be trusted, so later stages never use its fields.
 func (v *verification) checkObject(series contract.Series, entry ObjectEntry) (checkedObject, bool) {
 	subject := objectSubject(series, entry.ObjectIndex)
 	checkpoint, err := v.verifyCheckpointSignature(entry)
@@ -156,16 +160,23 @@ func (v *verification) checkObject(series contract.Series, entry ObjectEntry) (c
 	if !v.checkCheckpointFields(subject, series, entry, checkpoint) {
 		return checkedObject{}, false
 	}
-	obj := checkedObject{entry: entry, checkpoint: checkpoint}
-	stored, err := v.bundle.storedObject(series, entry.ObjectIndex)
+	obj := checkedObject{checkpoint: checkpoint}
+	stored, err := v.bundle.storedObject(series, entry.ObjectIndex, checkpoint.CiphertextBytes)
+	if errors.Is(err, os.ErrNotExist) {
+		v.report.incomplete(subject, "gap: stored object %s is not in the bundle", StoredObjectPath(series, entry.ObjectIndex))
+		return obj, true
+	}
 	if err != nil {
-		v.report.tampered(subject, "stored object %s missing: %v", StoredObjectPath(series, entry.ObjectIndex), err)
+		v.report.tampered(subject, "stored object: %v", err)
 		return obj, true
 	}
 	if !checkDigest(v.report, subject, "ciphertext", stored, checkpoint.CiphertextBytes, checkpoint.CiphertextSHA256) {
 		return obj, true
 	}
-	obj.plaintext = v.decrypt(subject, series, entry.ObjectIndex, stored, checkpoint)
+	plaintext := v.decrypt(subject, series, entry.ObjectIndex, stored, checkpoint)
+	if series == contract.SeriesE {
+		obj.plaintext = plaintext
+	}
 	return obj, true
 }
 
@@ -208,16 +219,10 @@ func kindMatches(series contract.Series, listedKind string, signed contract.Chec
 	if series == contract.SeriesE {
 		return signed == contract.KindEvents
 	}
-	switch listedKind {
-	case "init":
-		return signed == contract.KindVideoInit
-	case "media":
-		return signed == contract.KindVideoMedia
-	case "":
+	if listedKind == "" {
 		return signed == contract.KindVideoInit || signed == contract.KindVideoMedia
-	default:
-		return false
 	}
+	return listedKind == videoKindName(signed)
 }
 
 func checkDigest(r *Report, subject, what string, data []byte, wantLen uint64, wantSha [32]byte) bool {
@@ -246,234 +251,4 @@ func (v *verification) decrypt(subject string, series contract.Series, objectInd
 		return nil
 	}
 	return plaintext
-}
-
-func (v *verification) verifyChain(chunks []checkedObject) {
-	if len(chunks) == 0 {
-		v.report.incomplete("E", "no event chunks in the bundle")
-		return
-	}
-	var prevHash [32]byte
-	nextSeq := uint64(0)
-	v.eventsComplete = true
-	for i, chunk := range chunks {
-		c := chunk.checkpoint
-		subject := objectSubject(contract.SeriesE, c.ObjectIndex)
-		if c.ObjectIndex != uint32(i) {
-			v.report.tampered(subject, "event chunks %d..%d are missing", i, c.ObjectIndex-1)
-		}
-		if chunk.plaintext == nil {
-			v.eventsComplete = false
-			continue
-		}
-		envelopes, raws, err := contract.ParseEnvelopes(chunk.plaintext)
-		if err != nil || len(envelopes) == 0 {
-			v.report.tampered(subject, "event chunk does not parse: %v", err)
-			v.eventsComplete = false
-			continue
-		}
-		if c.FirstSeq != nextSeq {
-			v.report.tampered(subject, "seq gap: expected first seq %d, checkpoint starts at %d", nextSeq, c.FirstSeq)
-			prevHash = envelopes[0].PrevHash
-		}
-		v.verifyChunkChain(subject, chunk.plaintext, c, prevHash)
-		v.collectEvents(envelopes, raws)
-		prevHash, nextSeq = c.ChainHead, c.LastSeq+1
-	}
-}
-
-func (v *verification) verifyChunkChain(subject string, plaintext []byte, c *contract.Checkpoint, prevHash [32]byte) {
-	head, lastSeq, err := contract.VerifyChainSegment(plaintext, c.FirstSeq, prevHash)
-	switch {
-	case err != nil:
-		v.report.tampered(subject, "hash chain: %v", err)
-	case head != c.ChainHead:
-		v.report.tampered(subject, "chain head does not match the checkpoint")
-	case lastSeq != c.LastSeq:
-		v.report.tampered(subject, "last seq %d, checkpoint says %d", lastSeq, c.LastSeq)
-	}
-}
-
-func (v *verification) collectEvents(envelopes []contract.Envelope, raws [][]byte) {
-	for i, e := range envelopes {
-		v.events[e.Seq] = chainEvent{envelope: e, hash: contract.EventHash(raws[i])}
-		if e.Seq > v.maxSeq {
-			v.maxSeq = e.Seq
-		}
-	}
-	v.report.Events = len(v.events)
-}
-
-func seqSubject(seq uint64) string { return fmt.Sprintf("seq %d", seq) }
-
-func (v *verification) verifyLifecycle() {
-	if len(v.events) == 0 {
-		return
-	}
-	v.verifySessionOpen()
-	for seq := uint64(0); seq <= v.maxSeq; seq++ {
-		e, ok := v.events[seq]
-		if !ok {
-			continue
-		}
-		switch e.envelope.Type {
-		case contract.EventLoss:
-			v.reportLoss(seq, e.envelope.Body)
-		case contract.EventContinuityUnknown:
-			v.report.incomplete(seqSubject(seq), "gateway-reported continuity gap: %s", e.envelope.Body)
-		case contract.EventSessionEnd:
-			v.verifySessionEnd(seq, e.envelope.Body)
-		}
-	}
-	if !v.ended {
-		v.report.incomplete(seqSubject(v.maxSeq), "no session_end record after the last event")
-	}
-}
-
-type sessionOpenBody struct {
-	RecordingKey   RecordingKey `json:"recordingKey"`
-	SessionKeyCert string       `json:"sessionKeyCert"`
-}
-
-func (v *verification) verifySessionOpen() {
-	e, ok := v.events[0]
-	if !ok || e.envelope.Type != contract.EventSessionOpen {
-		v.report.tampered(seqSubject(0), "the chain does not start with session_open")
-		return
-	}
-	var body sessionOpenBody
-	if err := json.Unmarshal(e.envelope.Body, &body); err != nil {
-		v.report.tampered(seqSubject(0), "session_open body: %v", err)
-		return
-	}
-	// The chain is signed, so a field the gateway recorded must agree with the verified keys; absent fields are skipped.
-	recorded := []struct{ name, got, want string }{
-		{"recording public key", body.RecordingKey.PublicKey, base64.StdEncoding.EncodeToString(v.recordingPub)},
-		{"recording key fingerprint", body.RecordingKey.Fingerprint, contract.Fingerprint(v.recordingPub)},
-		{"recording key id", body.RecordingKey.KeyID, contract.KeyIDHex(v.recordingPub)},
-		{"session key certificate", body.SessionKeyCert, v.bundle.Replay.KeyCert},
-	}
-	for _, field := range recorded {
-		if field.got != "" && field.got != field.want {
-			v.report.tampered(seqSubject(0), "session_open records a different %s", field.name)
-		}
-	}
-}
-
-type lossBody struct {
-	Stream string `json:"stream"`
-	Count  int64  `json:"count"`
-	Reason string `json:"reason"`
-}
-
-func (v *verification) reportLoss(seq uint64, raw []byte) {
-	var body lossBody
-	if err := json.Unmarshal(raw, &body); err != nil {
-		v.report.tampered(seqSubject(seq), "loss body: %v", err)
-		return
-	}
-	if body.Stream == contract.SeriesV.Letter() {
-		v.videoLoss = true
-	}
-	v.report.incomplete(seqSubject(seq), "gateway-reported loss on stream %s: %d lost (%s)", body.Stream, body.Count, body.Reason)
-}
-
-func (v *verification) verifySessionEnd(seq uint64, raw []byte) {
-	v.ended = true
-	var body struct {
-		FinalSeq *uint64 `json:"finalSeq"`
-	}
-	if err := json.Unmarshal(raw, &body); err != nil || body.FinalSeq == nil {
-		v.report.tampered(seqSubject(seq), "session_end body has no finalSeq")
-		return
-	}
-	if *body.FinalSeq != seq {
-		v.report.tampered(seqSubject(seq), "session_end finalSeq %d is not its own seq", *body.FinalSeq)
-	}
-	if seq != v.maxSeq {
-		v.report.tampered(seqSubject(seq), "events recorded after session_end (last seq %d)", v.maxSeq)
-	}
-}
-
-type videoEventBody struct {
-	ObjectIndex *uint32 `json:"objectIndex"`
-	Sha256      string  `json:"sha256"`
-}
-
-func (v *verification) verifyVideoBinding(videos []checkedObject) {
-	present := map[uint32]bool{}
-	for _, obj := range videos {
-		present[obj.checkpoint.ObjectIndex] = true
-		v.verifyVideoObjectBinding(obj.checkpoint)
-	}
-	v.verifyVideoEventsHaveObjects(present)
-}
-
-func (v *verification) verifyVideoObjectBinding(c *contract.Checkpoint) {
-	subject := objectSubject(contract.SeriesV, c.ObjectIndex)
-	if c.FirstSeq != c.LastSeq {
-		v.report.tampered(subject, "video checkpoint covers seq %d..%d, expected one event", c.FirstSeq, c.LastSeq)
-		return
-	}
-	e, ok := v.events[c.LastSeq]
-	if !ok {
-		v.unbound(subject, "its event seq %d is not in the bundle's event chunks", c.LastSeq)
-		return
-	}
-	if e.envelope.Type != videoEventType(c.Kind) {
-		v.report.tampered(subject, "seq %d is %s, expected %s", c.LastSeq, e.envelope.Type, videoEventType(c.Kind))
-		return
-	}
-	var body videoEventBody
-	if err := json.Unmarshal(e.envelope.Body, &body); err != nil || body.ObjectIndex == nil {
-		v.report.tampered(subject, "seq %d body has no objectIndex", c.LastSeq)
-		return
-	}
-	if *body.ObjectIndex != c.ObjectIndex {
-		v.report.tampered(subject, "seq %d names video object %d", c.LastSeq, *body.ObjectIndex)
-	}
-	if !strings.EqualFold(body.Sha256, hex.EncodeToString(c.PlaintextSHA256[:])) {
-		v.report.tampered(subject, "seq %d records a different plaintext SHA-256", c.LastSeq)
-	}
-	if !bytes.Equal(e.hash[:], c.ChainHead[:]) {
-		v.report.tampered(subject, "chain head is not the hash of seq %d", c.LastSeq)
-	}
-}
-
-func (v *verification) unbound(subject, format string, args ...any) {
-	if v.ended {
-		v.report.tampered(subject, "not bound to the chain: "+format, args...)
-		return
-	}
-	v.report.incomplete(subject, "binding pending: "+format, args...)
-}
-
-func videoEventType(kind contract.CheckpointKind) contract.EventType {
-	if kind == contract.KindVideoInit {
-		return contract.EventVInit
-	}
-	return contract.EventVSegment
-}
-
-func (v *verification) verifyVideoEventsHaveObjects(present map[uint32]bool) {
-	for seq := uint64(0); seq <= v.maxSeq; seq++ {
-		e, ok := v.events[seq]
-		if !ok || (e.envelope.Type != contract.EventVInit && e.envelope.Type != contract.EventVSegment) {
-			continue
-		}
-		var body videoEventBody
-		if err := json.Unmarshal(e.envelope.Body, &body); err != nil || body.ObjectIndex == nil {
-			v.report.tampered(seqSubject(seq), "%s body has no objectIndex", e.envelope.Type)
-			continue
-		}
-		if present[*body.ObjectIndex] {
-			continue
-		}
-		subject := objectSubject(contract.SeriesV, *body.ObjectIndex)
-		if v.videoLoss {
-			v.report.incomplete(subject, "recorded at seq %d but missing; covered by a gateway loss record", seq)
-		} else {
-			v.report.tampered(subject, "recorded at seq %d but missing from the bundle", seq)
-		}
-	}
 }

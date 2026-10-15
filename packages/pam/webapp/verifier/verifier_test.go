@@ -1,11 +1,14 @@
 package verifier
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Infisical/infisical-merge/packages/pam/webapp/contract"
@@ -71,7 +74,7 @@ func vectorBundle(t *testing.T) (string, keyVector) {
 		series := contract.Series(v.Series)
 		entry := ObjectEntry{ObjectIndex: v.ObjectIndex, Checkpoint: hexB64(t, v.CheckpointHex), Signature: hexB64(t, v.SignatureHex)}
 		if series == contract.SeriesV {
-			entry.Kind = map[uint8]string{1: "init", 2: "media"}[v.Kind]
+			entry.Kind = videoKindName(contract.CheckpointKind(v.Kind))
 			replay.Video.Objects = append(replay.Video.Objects, entry)
 		} else {
 			replay.Events.Chunks = append(replay.Events.Chunks, entry)
@@ -178,17 +181,68 @@ func TestMutations(t *testing.T) {
 			verdict: VerdictTampered, exit: ExitTampered,
 		},
 		{
+			// CONTRACTS.md 6.10/6.11: a missing object or seq gap without a loss record is a Gap, exit 3.
 			name: "removed checkpoint",
 			mutate: func(t *testing.T, _ *testSession, dir string) string {
 				editReplay(t, dir, func(r *Replay) { r.Events.Chunks = r.Events.Chunks[1:] })
 				return ""
 			},
-			verdict: VerdictTampered, exit: ExitTampered,
+			verdict: VerdictIncomplete, exit: ExitIncomplete,
 		},
 		{
 			name: "removed video object without a loss record",
 			mutate: func(t *testing.T, _ *testSession, dir string) string {
 				editReplay(t, dir, func(r *Replay) { r.Video.Objects = r.Video.Objects[:1] })
+				return ""
+			},
+			verdict: VerdictIncomplete, exit: ExitIncomplete,
+		},
+		{
+			name: "listed object whose file is missing",
+			mutate: func(t *testing.T, _ *testSession, dir string) string {
+				require.NoError(t, os.Remove(filepath.Join(dir, StoredObjectPath(contract.SeriesV, 1))))
+				return ""
+			},
+			verdict: VerdictIncomplete, exit: ExitIncomplete,
+		},
+		{
+			name: "session key swapped for another valid key",
+			mutate: func(t *testing.T, _ *testSession, dir string) string {
+				other := b64(bytes.Repeat([]byte{0x22}, sessionKeySize))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, SessionKeyFile), []byte(other), 0o600))
+				return ""
+			},
+			verdict: VerdictTampered, exit: ExitTampered,
+		},
+		{
+			name: "stored object replaced by a symlink",
+			mutate: func(t *testing.T, _ *testSession, dir string) string {
+				path := filepath.Join(dir, StoredObjectPath(contract.SeriesE, 0))
+				require.NoError(t, os.Remove(path))
+				require.NoError(t, os.Symlink("/dev/zero", path))
+				return ""
+			},
+			verdict: VerdictTampered, exit: ExitTampered,
+		},
+		{
+			name: "stored object padded beyond its signed size",
+			mutate: func(t *testing.T, _ *testSession, dir string) string {
+				path := filepath.Join(dir, StoredObjectPath(contract.SeriesV, 0))
+				f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+				require.NoError(t, err)
+				_, err = f.Write(make([]byte, 4096))
+				require.NoError(t, err)
+				require.NoError(t, f.Close())
+				return ""
+			},
+			verdict: VerdictTampered, exit: ExitTampered,
+		},
+		{
+			name: "replay.json advertises another fingerprint",
+			mutate: func(t *testing.T, _ *testSession, dir string) string {
+				editReplay(t, dir, func(r *Replay) {
+					r.RecordingKey.Fingerprint = contract.Fingerprint(otherKey.Public().(ed25519.PublicKey))
+				})
 				return ""
 			},
 			verdict: VerdictTampered, exit: ExitTampered,
@@ -260,4 +314,40 @@ func TestMutations(t *testing.T) {
 			require.NotEmpty(t, report.Findings)
 		})
 	}
+}
+
+func TestEventsAfterEndAreTampered(t *testing.T) {
+	s := recordSession(t, sessionOptions{withEnd: true, mediaCount: 1})
+	s.event(contract.EventHeartbeat, map[string]any{"lastSeq": s.chain.NextSeq() - 1})
+	s.sealChunk()
+	report := verifyDir(t, s.write(), s.fingerprint())
+	require.Equal(t, VerdictTampered, report.Verdict, "findings: %+v", report.Findings)
+}
+
+func TestHugeSeqDoesNotHang(t *testing.T) {
+	s := recordSession(t, sessionOptions{withEnd: true, mediaCount: 1})
+	s.chain = contract.ResumeChain(math.MaxUint64, s.chain.Head())
+	s.firstSeq = math.MaxUint64
+	s.event(contract.EventHeartbeat, map[string]any{"lastSeq": 0})
+	s.sealChunk()
+	report := verifyDir(t, s.write(), s.fingerprint())
+	require.Equal(t, VerdictTampered, report.Verdict, "findings: %+v", report.Findings)
+}
+
+func TestTextReportEscapesControlCharacters(t *testing.T) {
+	s := recordSession(t, sessionOptions{withEnd: true})
+	dir := s.write()
+	editReplay(t, dir, func(r *Replay) { r.ProjectID = "x\u001b[1A\u001b[2KVerified" })
+	var out bytes.Buffer
+	require.NoError(t, verifyDir(t, dir, s.fingerprint()).WriteText(&out))
+	require.NotContains(t, out.String(), "\x1b")
+	require.True(t, strings.HasPrefix(out.String(), string(VerdictTampered)), out.String())
+}
+
+func TestMalformedBundle(t *testing.T) {
+	s := recordSession(t, sessionOptions{withEnd: true})
+	dir := s.write()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ReplayFile), []byte("{not json"), 0o644))
+	_, err := LoadBundle(dir)
+	require.ErrorIs(t, err, ErrMalformedBundle)
 }

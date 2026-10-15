@@ -3,6 +3,8 @@ package verifier
 import (
 	"fmt"
 	"io"
+	"strings"
+	"unicode"
 )
 
 type Verdict string
@@ -13,7 +15,6 @@ const (
 	VerdictTampered   Verdict = "Tampered"
 )
 
-// Exit codes of webapp-verify. ExitUsage is used by the binary for bad flags or an unreadable bundle.
 const (
 	ExitVerified   = 0
 	ExitTampered   = 1
@@ -87,14 +88,25 @@ func (r *Report) ExitCode() int {
 	}
 }
 
+// printable replaces control characters, so bundle-supplied text cannot rewrite the terminal (for example an escape
+// sequence that overwrites the verdict line).
+func printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return '?'
+	}, s)
+}
+
 func (r *Report) WriteText(w io.Writer) error {
 	_, err := fmt.Fprintf(w, "%s\n  session      %s (project %s)\n  trusted key  %s\n  checked      %d event chunks, %d video objects, %d events\n",
-		r.Verdict, r.SessionID, r.ProjectID, r.Fingerprint, r.EventChunks, r.VideoObjects, r.Events)
+		r.Verdict, printable(r.SessionID), printable(r.ProjectID), printable(r.Fingerprint), r.EventChunks, r.VideoObjects, r.Events)
 	if err != nil {
 		return err
 	}
 	for _, f := range r.Findings {
-		if _, err := fmt.Fprintf(w, "  %-10s  %-12s %s\n", f.Severity, f.Subject, f.Message); err != nil {
+		if _, err := fmt.Fprintf(w, "  %-10s  %-12s %s\n", f.Severity, printable(f.Subject), printable(f.Message)); err != nil {
 			return err
 		}
 	}
