@@ -3,8 +3,10 @@ package webapp
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"net"
 	"net/http"
 	"net/netip"
@@ -211,7 +213,7 @@ func (h *harness) params() SessionParams {
 	return SessionParams{
 		SessionID: hSession, ExpiresAt: time.Now().Add(time.Hour),
 		Credentials: &session.PAMCredentials{WebApp: &api.PAMWebAppDetails{
-			ConnectionDetails: api.PAMWebAppConnectionDetails{URL: "https://app.corp.internal/", AllowedHosts: []string{"App.Corp.Internal"}, SSLCertificate: "-----BEGIN CERTIFICATE-----\nAPP CA\n-----END CERTIFICATE-----\n"},
+			ConnectionDetails: api.PAMWebAppConnectionDetails{URL: "https://app.corp.internal/", AllowedHosts: []string{"App.Corp.Internal"}},
 			Credentials:       api.PAMWebAppCredentials{AuthMethod: "none"},
 		}},
 		Recording: &session.PAMRecordingSecrets{SessionKey: h.key, UploadToken: "upload-token", ProjectId: hProject, SessionId: hSession},
@@ -294,7 +296,13 @@ func TestVS1Harness(t *testing.T) {
 	launch := h.sup.launches[0]
 	h.sup.mu.Unlock()
 	require.Equal(t, []string{"app.corp.internal"}, launch.AllowedHosts)
-	require.Contains(t, launch.CaPem, "APP CA")
+	block, _ := pem.Decode([]byte(launch.CaPem))
+	require.NotNil(t, block, "caPem is the gateway session CA")
+	caCert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+	require.True(t, caCert.IsCA)
+	require.Equal(t, []string{"app.corp.internal"}, caCert.PermittedDNSDomains)
+	require.NotContains(t, launch.CaPem, "PRIVATE KEY")
 	require.Equal(t, h.svc.cfg.ProxyAddr, launch.EgressProxyAddr)
 	require.True(t, (<-agent.welcome).OK)
 	start := <-agent.controls
@@ -647,4 +655,18 @@ func TestLiveWindowDegraded(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res.ByType(contract.EventViewerDegraded), 1)
 	require.Len(t, res.VMedia, 1)
+}
+
+// INFISICAL_WEBAPP_EGRESS_TUNNEL_ONLY keeps the VS1 tunnel: the runner trusts the app CA and no session CA exists.
+func TestEgressTunnelOnlyFallback(t *testing.T) {
+	h := newHarness(t)
+	h.svc.cfg.EgressTunnelOnly = true
+	p := h.params()
+	p.Credentials.WebApp.ConnectionDetails.SSLCertificate = "app-ca-pem"
+	v, _, done := startSession(t, h, p)
+	h.sup.mu.Lock()
+	caPem := h.sup.launches[0].CaPem
+	h.sup.mu.Unlock()
+	require.Equal(t, "app-ca-pem", caPem)
+	v.endSession(t, done)
 }

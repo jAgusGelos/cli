@@ -17,6 +17,7 @@ import (
 	"github.com/Infisical/infisical-merge/packages/pam/webapp/contract"
 	"github.com/Infisical/infisical-merge/packages/pam/webapp/egress"
 	"github.com/Infisical/infisical-merge/packages/pam/webapp/recorder"
+	"github.com/Infisical/infisical-merge/packages/pam/webapp/scrub"
 	"github.com/Infisical/infisical-merge/packages/pam/webapp/supervisor"
 	"github.com/rs/zerolog"
 )
@@ -39,6 +40,8 @@ type settings struct {
 	uploads            string
 	idleTimeoutMinutes int
 	bodyCapBytes       int
+	maskedHeaders      []string
+	maskedQueryParams  []string
 }
 
 func resolveSettings(in *api.PAMWebAppSettings) settings {
@@ -70,6 +73,8 @@ func resolveSettings(in *api.PAMWebAppSettings) settings {
 	if in.BodyCapBytes != nil {
 		s.bodyCapBytes = *in.BodyCapBytes
 	}
+	s.maskedHeaders = in.MaskedHeaders
+	s.maskedQueryParams = in.MaskedQueryParams
 	return s
 }
 
@@ -277,7 +282,17 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 		}
 	}()
 
-	runner, err := s.launchRunner(ctx, p, cfg, allowed, token)
+	sc := newScrubber(wa, cfg)
+	var l1 *egress.Interception
+	caPem := wa.ConnectionDetails.SSLCertificate // tunnel only: Chromium sees the app's own certificate
+	if !s.cfg.EgressTunnelOnly {
+		if l1, err = newInterception(p.SessionID, p.ExpiresAt, wa, cfg, allowed, sc); err != nil {
+			return fail(contract.ErrCodeInternal, err)
+		}
+		caPem = l1.CA.CertPEM()
+	}
+
+	runner, err := s.launchRunner(ctx, p, cfg, allowed, token, caPem)
 	if err != nil {
 		return fail(launchErrCode(err), fmt.Errorf("webapp: launch runner: %w", err))
 	}
@@ -295,7 +310,7 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 	}
 	pending.setIP(runnerIP)
 
-	rec, err := s.newRecorder(ls)
+	rec, err := s.newRecorder(ls, sc)
 	if err != nil {
 		return fail(contract.ErrCodeInternal, err)
 	}
@@ -315,7 +330,7 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 		l.Info().Str("reason", ls.reason()).Msg("Web App session ended")
 	}()
 
-	unregisterEgress := s.proxy.Register(runnerIP, &egress.Session{SessionID: p.SessionID, AllowedHosts: allowed, Record: ls.record})
+	unregisterEgress := s.proxy.Register(runnerIP, &egress.Session{SessionID: p.SessionID, AllowedHosts: allowed, Record: ls.record, L1: l1})
 	defer unregisterEgress()
 
 	tickDone := make(chan struct{})
@@ -419,15 +434,15 @@ func launchErrCode(err error) string {
 	return contract.ErrCodeRunnerUnavailable
 }
 
-func (s *Service) launchRunner(ctx context.Context, p SessionParams, cfg settings, allowed []string, token string) (*supervisor.LaunchResponse, error) {
+func (s *Service) launchRunner(ctx context.Context, p SessionParams, cfg settings, allowed []string, token, caPem string) (*supervisor.LaunchResponse, error) {
 	wa := p.Credentials.WebApp
 	agentAddr, proxyAddr := s.addrs()
 	launch := supervisor.LaunchRequest{
 		SessionID: p.SessionID, Image: s.cfg.RunnerImage, RunnerToken: token,
 		GatewayAgentAddr: agentAddr, EgressProxyAddr: proxyAddr,
 		StartURL: wa.ConnectionDetails.URL, AllowedHosts: allowed,
-		// Tunnel-only egress: Chromium sees the app's own certificate, so it trusts the app CA (certificate only).
-		CaPem:     wa.ConnectionDetails.SSLCertificate,
+		// The session MITM CA (certificate only), or the app CA in tunnel-only mode.
+		CaPem:     caPem,
 		Policy:    supervisor.Policy{Clipboard: cfg.clipboard, Downloads: cfg.downloads, Uploads: cfg.uploads, Kiosk: true},
 		Display:   defaultDisplay,
 		Recording: defaultRecording,
@@ -439,7 +454,7 @@ func (s *Service) launchRunner(ctx context.Context, p SessionParams, cfg setting
 	return s.sup.Launch(lctx, launch)
 }
 
-func (s *Service) newRecorder(ls *liveSession) (*recorder.Recorder, error) {
+func (s *Service) newRecorder(ls *liveSession, sc *scrub.Scrubber) (*recorder.Recorder, error) {
 	p := ls.p
 	return recorder.New(recorder.Options{
 		SessionID: p.SessionID, ProjectID: p.Recording.ProjectId, SessionKey: p.Recording.SessionKey,
@@ -449,6 +464,7 @@ func (s *Service) newRecorder(ls *liveSession) (*recorder.Recorder, error) {
 		ViewerConnected: func() bool { return ls.currentViewer() != nil },
 		OnOverflow:      func() { ls.recordingLoss(0) },
 		StatePath:       filepath.Join(s.cfg.StateDir, "webapp-sessions", p.SessionID+".json"),
+		Scrub:           sc.JSON,
 	})
 }
 

@@ -38,6 +38,9 @@ type Config struct {
 	StateDir         string // recording key directory
 	BackendURL       string // Infisical API base URL (config.INFISICAL_URL)
 	GatewayID        string
+	// EgressTunnelOnly falls back to the VS1 CONNECT tunnel: no MITM, no L1 bodies, runner caPem = the account
+	// sslCertificate (CONTRACTS.md 8b). A demo escape hatch, off by default.
+	EgressTunnelOnly bool
 
 	HealthInterval   time.Duration // supervisor health probe and bind retry period (2 s)
 	HealthTimeout    time.Duration // give up after this long (60 s)
@@ -61,6 +64,7 @@ func ConfigFromEnv(defaultStateDir string) Config {
 		AgentAddr:        env("INFISICAL_WEBAPP_AGENT_ADDR", DefaultAgentAddr),
 		ProxyAddr:        env("INFISICAL_WEBAPP_PROXY_ADDR", DefaultProxyAddr),
 		StateDir:         env("INFISICAL_GATEWAY_DIR", defaultStateDir),
+		EgressTunnelOnly: os.Getenv("INFISICAL_WEBAPP_EGRESS_TUNNEL_ONLY") == "1",
 	}
 }
 

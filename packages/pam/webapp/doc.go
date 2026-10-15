@@ -16,12 +16,19 @@
 //	INFISICAL_GATEWAY_DIR               directory of webapp-recording-key.pem (Ed25519, PKCS#8, mode 0600, created on
 //	                                    first start); default the gateway session recording dir
 //	                                    (/var/lib/infisical/session_recordings unless overridden)
+//	INFISICAL_WEBAPP_EGRESS_TUNNEL_ONLY "1" falls back to the VS1 CONNECT tunnel (no TLS interception, no L1 bodies,
+//	                                    runner caPem = the account sslCertificate); default off
 //
 // Both listeners bind only after the supervisor answers GET /v1/health with ok (the runner bridge, and so
 // 172.28.0.1, exists only then). The gateway retries every 2 s for 60 s and then logs
 // "Web App sessions disabled: supervisor unavailable"; every web-app session then fails with CONTROL error
 // runner_unavailable. At start the gateway logs "Web App recording key fingerprint: SHA256:..."; record it out of
 // band, it is the trust anchor of every replay.
+//
+// Egress TLS: every session gets a fresh in-memory MITM CA, name-constrained to the account allowlist; its
+// certificate (never its key) is the runner caPem. The proxy terminates the runner's TLS with single-SAN leaves of
+// that CA, verifies the app with the account sslCertificate (or the system roots when it is empty; skipped when
+// sslRejectUnauthorized is false), injects header credentials and records masked L1 events.
 //
 // Example (demo host):
 //
