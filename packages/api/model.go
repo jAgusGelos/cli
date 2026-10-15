@@ -971,6 +971,7 @@ type PAMSessionCredentialsResponse struct {
 	Credentials PAMSessionCredentials `json:"credentials"`
 	PolicyRules *PAMPolicyRules       `json:"policyRules,omitempty"`
 	Recording   *PAMRecordingResponse `json:"recording,omitempty"`
+	AccountId   string                `json:"accountId,omitempty"`
 }
 
 type PAMRecordingResponse struct {

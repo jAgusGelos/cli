@@ -245,7 +245,7 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 		return fail(contract.ErrCodeInternal, err)
 	}
 	if err := rec.Open(recorder.SessionOpen{
-		GatewayID: s.gatewayID(), StartURL: wa.ConnectionDetails.URL, AllowedHosts: allowed,
+		GatewayID: s.gatewayID(), AccountID: p.Credentials.AccountId, StartURL: wa.ConnectionDetails.URL, AllowedHosts: allowed,
 		Runner: recorder.RunnerInfo{Image: s.cfg.RunnerImage, IP: runner.IP},
 	}); err != nil {
 		return fail(contract.ErrCodeInternal, err)
