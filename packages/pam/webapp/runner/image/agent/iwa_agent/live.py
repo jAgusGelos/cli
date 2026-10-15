@@ -10,7 +10,6 @@ LIVE_QUEUE = 8
 GOP = 300
 DEFAULT_CODEC = "avc1.42E01F"
 VP9_CODEC = "vp09.00.10.08"
-CODECS = ("vp9", "h264")
 
 
 def annexb_nals(data):
@@ -52,6 +51,7 @@ class _LiveBase:
     """`emit(ftype, payload, flags, timestamp_us)` sends a frame on the agent link."""
 
     name = None
+    codec_lib = None
 
     def __init__(self, width, height, fps, emit, epoch, bitrate_kbps=2500, log=None):
         self.width, self.height, self.fps = width, height, fps
@@ -100,6 +100,17 @@ class _LiveBase:
             self._thread.join(timeout)
 
     def _encoder(self, av):
+        enc = av.CodecContext.create(self.codec_lib, "w")
+        enc.width, enc.height, enc.pix_fmt = self.width, self.height, "yuv420p"
+        enc.time_base = Fraction(1, self.fps)
+        enc.framerate = Fraction(self.fps, 1)
+        enc.gop_size = GOP
+        enc.bit_rate = self.bitrate_kbps * 1000
+        enc.options = self._options()
+        enc.open()
+        return enc
+
+    def _options(self):
         raise NotImplementedError
 
     def _config(self, data):
@@ -154,18 +165,11 @@ class _LiveBase:
 
 
 class LiveEncoder(_LiveBase):
-    """H.264 live encoder."""
-
     name = "h264"
+    codec_lib = "libx264"
 
-    def _encoder(self, av):
-        enc = av.CodecContext.create("libx264", "w")
-        enc.width, enc.height, enc.pix_fmt = self.width, self.height, "yuv420p"
-        enc.time_base = Fraction(1, self.fps)
-        enc.framerate = Fraction(self.fps, 1)
-        enc.gop_size = GOP
-        enc.bit_rate = self.bitrate_kbps * 1000
-        enc.options = {
+    def _options(self):
+        return {
             "preset": "veryfast",
             "tune": "zerolatency",
             "profile": "baseline",
@@ -176,8 +180,6 @@ class LiveEncoder(_LiveBase):
             "bufsize": f"{self.bitrate_kbps}k",
             "x264-params": "repeat-headers=1:annexb=1",
         }
-        enc.open()
-        return enc
 
     def _config(self, data):
         # CONTRACTS 1.6: the exact WebCodecs string, derived from the SPS x264 actually emits.
@@ -190,15 +192,10 @@ class VP9LiveEncoder(_LiveBase):
     """VP9 live encoder: profile 0, 8 bit 4:2:0, one VIDEO_CHUNK per frame (lag 0, no alt-ref)."""
 
     name = "vp9"
+    codec_lib = "libvpx-vp9"
 
-    def _encoder(self, av):
-        enc = av.CodecContext.create("libvpx-vp9", "w")
-        enc.width, enc.height, enc.pix_fmt = self.width, self.height, "yuv420p"
-        enc.time_base = Fraction(1, self.fps)
-        enc.framerate = Fraction(self.fps, 1)
-        enc.gop_size = GOP
-        enc.bit_rate = self.bitrate_kbps * 1000
-        enc.options = {
+    def _options(self):
+        return {
             "deadline": "realtime",
             "cpu-used": "8",
             "row-mt": "1",
@@ -211,8 +208,6 @@ class VP9LiveEncoder(_LiveBase):
             "minrate": f"{self.bitrate_kbps // 4}k",
             "bufsize": f"{self.bitrate_kbps}k",
         }
-        enc.open()
-        return enc
 
     def _config(self, data):
         self.codec = VP9_CODEC
@@ -220,6 +215,9 @@ class VP9LiveEncoder(_LiveBase):
                 "epoch": self.epoch}
 
 
+ENCODERS = {"vp9": VP9LiveEncoder, "h264": LiveEncoder}
+CODECS = tuple(ENCODERS)
+
+
 def encoder_class(codec):
-    """Live encoder class for a `live_start.codec` value, or None."""
-    return {"h264": LiveEncoder, "vp9": VP9LiveEncoder}.get(codec)
+    return ENCODERS.get(codec)

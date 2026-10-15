@@ -60,10 +60,12 @@ def encode(ftype, flags, seq, timestamp_us, payload=b"", limit=MAX_AGENT_PAYLOAD
     return HEADER.pack(VERSION, ftype, flags, seq % U32, timestamp_us, len(payload)) + payload
 
 
-def parse_header(header):
+def parse_header(header, limit=MAX_AGENT_PAYLOAD):
     version, ftype, flags, seq, ts, length = HEADER.unpack(header)
     if version != VERSION:
         raise FrameError("protocol_error", f"version {version}")
+    if length > limit:
+        raise FrameError("frame_too_large", f"{length} > {limit}")
     return ftype, flags, seq, ts, length
 
 
@@ -71,9 +73,7 @@ def decode(buf, limit=MAX_AGENT_PAYLOAD):
     """Decode exactly one frame from `buf`."""
     if len(buf) < HEADER_SIZE:
         raise FrameError("protocol_error", "short header")
-    ftype, flags, seq, ts, length = parse_header(buf[:HEADER_SIZE])
-    if length > limit:
-        raise FrameError("frame_too_large", f"{length} > {limit}")
+    ftype, flags, seq, ts, length = parse_header(buf[:HEADER_SIZE], limit)
     if len(buf) != HEADER_SIZE + length:
         raise FrameError("protocol_error", "length mismatch")
     return Frame(ftype, flags, seq, ts, bytes(buf[HEADER_SIZE:]))
@@ -98,9 +98,7 @@ def read_frame(reader, limit=MAX_AGENT_PAYLOAD):
         return None
     if len(header) != HEADER_SIZE:
         raise FrameError("protocol_error", "truncated header")
-    ftype, flags, seq, ts, length = parse_header(header)
-    if length > limit:
-        raise FrameError("frame_too_large", f"{length} > {limit}")
+    ftype, flags, seq, ts, length = parse_header(header, limit)
     payload = _read_exact(reader, length) if length else b""
     if payload is None or len(payload) != length:
         raise FrameError("protocol_error", "truncated payload")

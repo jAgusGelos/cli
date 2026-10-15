@@ -3,10 +3,8 @@ import threading
 import time
 
 WHEEL_STEP_PX = 40
-SHIFT_L = 0xFFE1
 REMAP_SETTLE_S = 0.05
 US_SHIFTED = '~!@#$%^&*()_+{}|:"<>?'
-TEXT_CONTROL = {"\n": 0xFF0D, "\t": 0xFF09}
 
 _NAMED = {
     "Enter": 0xFF0D, "NumpadEnter": 0xFF8D, "Tab": 0xFF09, "Backspace": 0xFF08, "Escape": 0xFF1B,
@@ -22,19 +20,23 @@ _NAMED = {
     "NumpadDecimal": 0xFFAE,
 }
 
+SHIFT_L = _NAMED["ShiftLeft"]
+TEXT_CONTROL = {"\n": _NAMED["Enter"], "\t": _NAMED["Tab"]}
+_FUNCTION_KEYS = {f"F{n}": 0xFFBE + n - 1 for n in range(1, 13)}
+
 CODE_TO_KEYSYM = dict(_NAMED)
 CODE_TO_KEYSYM.update({f"Key{chr(c)}": c + 0x20 for c in range(ord("A"), ord("Z") + 1)})
 CODE_TO_KEYSYM.update({f"Digit{d}": 0x30 + d for d in range(10)})
 CODE_TO_KEYSYM.update({f"Numpad{d}": 0xFFB0 + d for d in range(10)})
-CODE_TO_KEYSYM.update({f"F{n}": 0xFFBE + n - 1 for n in range(1, 13)})
+CODE_TO_KEYSYM.update(_FUNCTION_KEYS)
 
-KEY_TO_KEYSYM = {
-    "Enter": 0xFF0D, "Tab": 0xFF09, "Backspace": 0xFF08, "Escape": 0xFF1B, "Delete": 0xFFFF, "Insert": 0xFF63,
-    "Home": 0xFF50, "End": 0xFF57, "PageUp": 0xFF55, "PageDown": 0xFF56, "ArrowLeft": 0xFF51, "ArrowUp": 0xFF52,
-    "ArrowRight": 0xFF53, "ArrowDown": 0xFF54, "Shift": 0xFFE1, "Control": 0xFFE3, "Alt": 0xFFE9,
-    "Meta": 0xFFEB, "CapsLock": 0xFFE5, "ContextMenu": 0xFF67,
-}
-KEY_TO_KEYSYM.update({f"F{n}": 0xFFBE + n - 1 for n in range(1, 13)})
+_KEY_NAMES_SHARED_WITH_CODES = (
+    "Enter", "Tab", "Backspace", "Escape", "Delete", "Insert", "Home", "End", "PageUp", "PageDown",
+    "ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown", "CapsLock", "ContextMenu",
+)
+KEY_TO_KEYSYM = {name: _NAMED[name] for name in _KEY_NAMES_SHARED_WITH_CODES}
+KEY_TO_KEYSYM.update({mod: _NAMED[mod + "Left"] for mod in ("Shift", "Control", "Alt", "Meta")})
+KEY_TO_KEYSYM.update(_FUNCTION_KEYS)
 
 BUTTON_MAP = {0: 1, 1: 2, 2: 3}
 

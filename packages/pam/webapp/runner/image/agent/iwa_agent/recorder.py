@@ -117,7 +117,6 @@ def parse_init(init):
 
 
 def moof_sample_count(moof):
-    """Sum of trun sample_count over every traf in a moof box."""
     total = 0
     for btype, off, size, hdr in iter_boxes(moof):
         if btype != b"moof":

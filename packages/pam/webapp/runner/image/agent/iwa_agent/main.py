@@ -285,7 +285,6 @@ def _on_sigterm(signum, frame):
 
 
 def connect(cfg, agent, budget_s):
-    """Dial, handshake and attach the outbox. Returns the welcomed link."""
     deadline = time.monotonic() + budget_s
     while True:
         sock = dial(cfg.gateway_addr, budget_s=max(0.0, deadline - time.monotonic()), log=log)

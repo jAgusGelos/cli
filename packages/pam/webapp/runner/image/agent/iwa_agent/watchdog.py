@@ -32,7 +32,6 @@ class Win:
 
 
 def is_candidate(w):
-    """A real, visible, managed-style top-level window (not a menu, tooltip or tiny helper window)."""
     if not w.viewable or w.override_redirect:
         return False
     if w.width < MIN_SIZE or w.height < MIN_SIZE:
@@ -66,6 +65,30 @@ def client_base(wid, mask):
     return wid & ~mask
 
 
+def _prop_str(w, atom, ptype):
+    p = w.get_full_property(atom, ptype)
+    if not p or not p.value:
+        return ""
+    v = p.value
+    return v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+
+
+def _describe(d, atoms, w):
+    from Xlib import X, Xatom
+    attrs = w.get_attributes()
+    geo = w.get_geometry()
+    if attrs.map_state != X.IsViewable or attrs.override_redirect or attrs.win_class == X.InputOnly:
+        return Win(w.id, attrs.map_state == X.IsViewable, bool(attrs.override_redirect), geo.width, geo.height)
+    cls = w.get_wm_class() or ("", "")
+    name = _prop_str(w, atoms["_NET_WM_NAME"], atoms["UTF8_STRING"]) or (w.get_wm_name() or "")
+    role = _prop_str(w, atoms["WM_WINDOW_ROLE"], Xatom.STRING)
+    tr = w.get_full_property(Xatom.WM_TRANSIENT_FOR, Xatom.WINDOW)
+    tp = w.get_full_property(atoms["_NET_WM_WINDOW_TYPE"], Xatom.ATOM)
+    types = tuple(d.get_atom_name(a) for a in tp.value) if tp else ()
+    return Win(w.id, True, False, geo.width, geo.height, cls[1] or cls[0], str(name), role,
+               int(tr.value[0]) if tr and len(tr.value) else 0, types)
+
+
 class XWatchdog:
     """`emit(event_dict)` reports each closed window as `AGENT_EVENT watchdog_closed`."""
 
@@ -90,9 +113,8 @@ class XWatchdog:
             self._thread.join(timeout)
 
     def _run(self):
-        from Xlib import X, Xatom, display
+        from Xlib import display
         from Xlib.error import XError
-        from Xlib.protocol import event as xevent
         try:
             d = display.Display(self.display_name)
         except Exception as e:
@@ -103,54 +125,37 @@ class XWatchdog:
                                                "_NET_WM_NAME", "_NET_WM_WINDOW_TYPE", "UTF8_STRING")}
         mask = d.display.info.resource_id_mask
         self._log("watchdog_started", pollMs=int(self.poll_s * 1000))
-
-        def prop_str(w, name, ptype):
-            p = w.get_full_property(atoms[name], ptype)
-            if not p or not p.value:
-                return ""
-            v = p.value
-            return v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
-
-        def describe(w):
-            attrs = w.get_attributes()
-            geo = w.get_geometry()
-            if attrs.map_state != X.IsViewable or attrs.override_redirect or attrs.win_class == X.InputOnly:
-                return Win(w.id, attrs.map_state == X.IsViewable, bool(attrs.override_redirect), geo.width,
-                           geo.height)
-            cls = w.get_wm_class() or ("", "")
-            name = prop_str(w, "_NET_WM_NAME", atoms["UTF8_STRING"]) or (w.get_wm_name() or "")
-            role = prop_str(w, "WM_WINDOW_ROLE", Xatom.STRING)
-            tr = w.get_full_property(Xatom.WM_TRANSIENT_FOR, Xatom.WINDOW)
-            tp = w.get_full_property(atoms["_NET_WM_WINDOW_TYPE"], Xatom.ATOM)
-            types = tuple(d.get_atom_name(a) for a in tp.value) if tp else ()
-            return Win(w.id, True, False, geo.width, geo.height, cls[1] or cls[0], str(name), role,
-                       int(tr.value[0]) if tr and len(tr.value) else 0, types)
-
         while not self._stop.wait(self.poll_s):
             try:
-                wins = []
-                for child in root.query_tree().children:
-                    try:
-                        wins.append(describe(child))
-                    except XError:
-                        continue
-                prev = self.session_id
-                self.session_id, close = decide(wins, self.session_id)
-                if prev is None and self.session_id is not None:
-                    sw = next(w for w in wins if w.id == self.session_id)
-                    self._log("watchdog_session_window", window=hex(sw.id), wmClass=sw.wm_class, wmName=sw.wm_name)
-                live_ids = {w.id for w in close}
-                for wid in list(self._pending):
-                    if wid not in live_ids:
-                        del self._pending[wid]
-                for w in close:
-                    self._close(d, X, xevent, atoms, mask, w)
-                d.flush()
+                self._poll(d, root, atoms, mask)
             except XError as e:
                 self._log("watchdog_x_error", error=str(e)[:200])
             except Exception as e:
                 self._log("watchdog_error", error=f"{type(e).__name__}: {e}"[:200])
         d.close()
+
+    def _poll(self, d, root, atoms, mask):
+        from Xlib import X
+        from Xlib.error import XError
+        from Xlib.protocol import event as xevent
+        wins = []
+        for child in root.query_tree().children:
+            try:
+                wins.append(_describe(d, atoms, child))
+            except XError:
+                continue
+        prev = self.session_id
+        self.session_id, close = decide(wins, self.session_id)
+        if prev is None and self.session_id is not None:
+            sw = next(w for w in wins if w.id == self.session_id)
+            self._log("watchdog_session_window", window=hex(sw.id), wmClass=sw.wm_class, wmName=sw.wm_name)
+        live_ids = {w.id for w in close}
+        for wid in list(self._pending):
+            if wid not in live_ids:
+                del self._pending[wid]
+        for w in close:
+            self._close(d, X, xevent, atoms, mask, w)
+        d.flush()
 
     def _close(self, d, X, xevent, atoms, mask, w):
         now = time.monotonic()

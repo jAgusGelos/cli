@@ -5,6 +5,7 @@ import threading
 import time
 
 from . import frames
+from .live import CODECS
 
 AGENT_VERSION = "1.0.0"
 
@@ -151,11 +152,23 @@ def build_hello(cfg):
         "runnerToken": cfg.runner_token,
         "agentVersion": AGENT_VERSION,
         "imageDigest": cfg.image_digest,
-        "liveCodecs": ["vp9", "h264"],
+        "liveCodecs": list(CODECS),
         "recordingCodec": "h264",
         "encoderMode": "dual",
         "display": {"width": cfg.width, "height": cfg.height, "framerate": cfg.fps},
     }
+
+
+_Pending = collections.namedtuple("_Pending", "ftype payload flags ts span")
+_Span = collections.namedtuple("_Span", "start_us end_us frames")
+
+
+def _is_segment(item):
+    return item.span is not None
+
+
+def _is_droppable_other(item):
+    return item.span is None and item.ftype not in (frames.REC_INIT, frames.REC_LOSS)
 
 
 class Outbox:
@@ -184,7 +197,7 @@ class Outbox:
                 self._log("outbox_backlog_overflow", ranges=len(self.lost),
                           framesLost=sum(x["framesLost"] for x in self.lost))
             self.lost = []
-            out += [item[:4] for item in self._pending]
+            out += [(p.ftype, p.payload, p.flags, p.ts) for p in self._pending]
             self._pending.clear()
             self._seg_us = self._other = 0
             for k, item in enumerate(out):
@@ -225,18 +238,18 @@ class Outbox:
             return buffer
 
     def _buffer_locked(self, ftype, payload, flags, ts):
-        dur = None
+        span = None
         if ftype == frames.REC_SEGMENT:
             meta, _ = frames.split_meta(payload)
-            dur = (meta["startPtsUs"], meta["endPtsUs"], meta["frameCount"])
-            self._seg_us += dur[1] - dur[0]
+            span = _Span(meta["startPtsUs"], meta["endPtsUs"], meta["frameCount"])
+            self._seg_us += span.end_us - span.start_us
         else:
             self._other += 1
-        self._pending.append((ftype, payload, flags, ts, dur))
+        self._pending.append(_Pending(ftype, payload, flags, ts, span))
         while self._seg_us > self.backlog_us:
-            self._drop_oldest_locked(lambda it: it[4] is not None)
+            self._drop_oldest_locked(_is_segment)
         while self._other > self.max_other:
-            self._drop_oldest_locked(lambda it: it[4] is None and it[0] not in (frames.REC_INIT, frames.REC_LOSS))
+            self._drop_oldest_locked(_is_droppable_other)
 
     def _drop_oldest_locked(self, match):
         for k, item in enumerate(self._pending):
@@ -246,15 +259,15 @@ class Outbox:
         else:
             self._other = min(self._other, self.max_other)
             return
-        dur = item[4]
-        if dur is None:
+        span = item.span
+        if span is None:
             self._other -= 1
             self.dropped_other += 1
             return
-        self._seg_us -= dur[1] - dur[0]
-        if self.lost and self.lost[-1]["toPtsUs"] == dur[0]:
-            self.lost[-1]["toPtsUs"] = dur[1]
-            self.lost[-1]["framesLost"] += dur[2]
+        self._seg_us -= span.end_us - span.start_us
+        if self.lost and self.lost[-1]["toPtsUs"] == span.start_us:
+            self.lost[-1]["toPtsUs"] = span.end_us
+            self.lost[-1]["framesLost"] += span.frames
         else:
-            self.lost.append({"fromPtsUs": dur[0], "toPtsUs": dur[1], "framesLost": dur[2],
+            self.lost.append({"fromPtsUs": span.start_us, "toPtsUs": span.end_us, "framesLost": span.frames,
                               "reason": "agent_restart"})

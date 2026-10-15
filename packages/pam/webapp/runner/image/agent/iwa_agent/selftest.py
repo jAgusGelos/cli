@@ -10,10 +10,11 @@ import time
 
 from . import frames
 from .capture import Capture
-from .live import LiveEncoder, VP9LiveEncoder, nal_types
+from .live import VP9_CODEC, LiveEncoder, VP9LiveEncoder, nal_types
 from .recorder import Recorder
 
 W, H, FPS = 1280, 720, 30
+FORCE_AT = 45
 
 
 def log(event, **fields):
@@ -32,54 +33,74 @@ def headers_before_idr(types):
     return 5 in types and 7 in types and 8 in types and max(types.index(7), types.index(8)) < types.index(5)
 
 
-def live_test(outdir):
+def _run_live(encoder_cls, watermark, epoch):
     chunks = []
     done = threading.Event()
-    force_at = 45
 
     def emit(ftype, payload, flags, ts):
         chunks.append((ftype, payload, flags, ts))
         if sum(1 for c in chunks if c[0] == frames.VIDEO_CHUNK) >= 3 * FPS:
             done.set()
 
-    cap = Capture(W, H, FPS, "selftest live watermark", log=log)
-    live = LiveEncoder(W, H, FPS, emit, epoch=1, log=log)
+    cap = Capture(W, H, FPS, watermark, log=log)
+    live = encoder_cls(W, H, FPS, emit, epoch=epoch, log=log)
     seen = [0]
 
     def offer(idx, pts, wall, frame, raw_fn):
         seen[0] += 1
-        if seen[0] == force_at + 1:
+        if seen[0] == FORCE_AT + 1:
             live.request_keyframe()
         live.offer(idx, pts, wall, frame, raw_fn)
 
+    started = time.monotonic()
     live.start()
     cap.add_consumer(offer)
     cap.start()
     done.wait(15)
+    elapsed = time.monotonic() - started
     cap.stop()
     live.stop()
-    path = os.path.join(outdir, "selftest-live.h264")
     vchunks = [c for c in chunks if c[0] == frames.VIDEO_CHUNK]
+    config = json.loads(chunks[0][1]) if chunks and chunks[0][0] == frames.VIDEO_CONFIG else None
+    return vchunks, config, elapsed
+
+
+def _keyframe_fields(probe, vchunks):
+    return {
+        "ffprobeFrames": len(probe),
+        "size": f"{probe[0]['width']}x{probe[0]['height']}" if probe else None,
+        "firstPictType": probe[0]["pict_type"] if probe else None,
+        "keyframeIndexes": [i for i, fr in enumerate(probe) if fr.get("key_frame") == 1],
+        "keyframeFlagIndexes": [i for i, c in enumerate(vchunks) if c[2] & frames.FLAG_KEYFRAME],
+        "forcedRequestedAtFrame": FORCE_AT,
+    }
+
+
+def _forced_keyframe_ok(key_idx):
+    return any(FORCE_AT <= k <= FORCE_AT + 2 for k in key_idx)
+
+
+def _monotonic(vchunks):
+    return all(vchunks[i][3] < vchunks[i + 1][3] for i in range(len(vchunks) - 1))
+
+
+def live_test(outdir):
+    vchunks, config, _ = _run_live(LiveEncoder, "selftest live watermark", epoch=1)
+    path = os.path.join(outdir, "selftest-live.h264")
     with open(path, "wb") as f:
         for c in vchunks:
             f.write(c[1])
     probe = ffprobe_frames(path)
-    key_idx = [i for i, fr in enumerate(probe) if fr.get("key_frame") == 1]
     headers_ok = all(headers_before_idr(nal_types(c[1])) for c in vchunks if c[2] & frames.FLAG_KEYFRAME)
-    flagged = [i for i, c in enumerate(vchunks) if c[2] & frames.FLAG_KEYFRAME]
-    config = json.loads(chunks[0][1]) if chunks and chunks[0][0] == frames.VIDEO_CONFIG else None
     result = {
         "test": "live", "file": path, "bytes": os.path.getsize(path), "chunks": len(vchunks),
-        "videoConfig": config, "ffprobeFrames": len(probe),
-        "size": f"{probe[0]['width']}x{probe[0]['height']}" if probe else None,
-        "firstPictType": probe[0]["pict_type"] if probe else None,
-        "keyframeIndexes": key_idx, "keyframeFlagIndexes": flagged, "forcedRequestedAtFrame": force_at,
+        "videoConfig": config, **_keyframe_fields(probe, vchunks),
         "spsPpsBeforeEveryIdr": headers_ok, "startsWithStartCode": bool(vchunks) and vchunks[0][1][:4] == b"\0\0\0\1",
-        "monotonicTimestamps": all(vchunks[i][3] < vchunks[i + 1][3] for i in range(len(vchunks) - 1)),
+        "monotonicTimestamps": _monotonic(vchunks),
     }
-    forced_ok = any(force_at <= k <= force_at + 2 for k in key_idx)
+    key_idx = result["keyframeIndexes"]
     result["ok"] = bool(probe) and result["size"] == f"{W}x{H}" and result["firstPictType"] == "I" \
-        and key_idx[:1] == [0] and forced_ok and headers_ok and result["startsWithStartCode"]
+        and key_idx[:1] == [0] and _forced_keyframe_ok(key_idx) and headers_ok and result["startsWithStartCode"]
     return result
 
 
@@ -92,56 +113,24 @@ def write_ivf(path, payloads, fps):
 
 
 def live_vp9_test(outdir):
-    chunks = []
-    done = threading.Event()
-    force_at = 45
-
-    def emit(ftype, payload, flags, ts):
-        chunks.append((ftype, payload, flags, ts))
-        if sum(1 for c in chunks if c[0] == frames.VIDEO_CHUNK) >= 3 * FPS:
-            done.set()
-
-    cap = Capture(W, H, FPS, "selftest vp9 watermark", log=log)
-    live = VP9LiveEncoder(W, H, FPS, emit, epoch=2, log=log)
-    seen = [0]
-
-    def offer(idx, pts, wall, frame, raw_fn):
-        seen[0] += 1
-        if seen[0] == force_at + 1:
-            live.request_keyframe()
-        live.offer(idx, pts, wall, frame, raw_fn)
-
-    started = time.monotonic()
-    live.start()
-    cap.add_consumer(offer)
-    cap.start()
-    done.wait(15)
-    elapsed = time.monotonic() - started
-    cap.stop()
-    live.stop()
+    vchunks, config, elapsed = _run_live(VP9LiveEncoder, "selftest vp9 watermark", epoch=2)
     path = os.path.join(outdir, "selftest-live.ivf")
-    vchunks = [c for c in chunks if c[0] == frames.VIDEO_CHUNK]
     write_ivf(path, [c[1] for c in vchunks], FPS)
     probe = ffprobe_frames(path)
-    key_idx = [i for i, fr in enumerate(probe) if fr.get("key_frame") == 1]
-    flagged = [i for i, c in enumerate(vchunks) if c[2] & frames.FLAG_KEYFRAME]
-    config = json.loads(chunks[0][1]) if chunks and chunks[0][0] == frames.VIDEO_CONFIG else None
     codec = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                             "stream=codec_name,profile,pix_fmt", "-of", "json", path],
                            capture_output=True, text=True).stdout
     result = {
         "test": "live-vp9", "file": path, "bytes": os.path.getsize(path), "chunks": len(vchunks),
-        "videoConfig": config, "stream": json.loads(codec or "{}").get("streams"), "ffprobeFrames": len(probe),
-        "size": f"{probe[0]['width']}x{probe[0]['height']}" if probe else None,
-        "firstPictType": probe[0]["pict_type"] if probe else None,
-        "keyframeIndexes": key_idx, "keyframeFlagIndexes": flagged, "forcedRequestedAtFrame": force_at,
+        "videoConfig": config, "stream": json.loads(codec or "{}").get("streams"),
+        **_keyframe_fields(probe, vchunks),
         "kbpsMeasured": round(sum(len(c[1]) for c in vchunks) * 8 / 1000 / max(elapsed, 0.001)),
-        "monotonicTimestamps": all(vchunks[i][3] < vchunks[i + 1][3] for i in range(len(vchunks) - 1)),
+        "monotonicTimestamps": _monotonic(vchunks),
     }
-    forced_ok = any(force_at <= k <= force_at + 2 for k in key_idx)
+    key_idx = result["keyframeIndexes"]
     result["ok"] = bool(probe) and len(probe) == len(vchunks) and result["size"] == f"{W}x{H}" \
-        and key_idx[:1] == [0] and flagged == key_idx and forced_ok and config is not None \
-        and config.get("codec") == "vp09.00.10.08" and "format" not in config
+        and key_idx[:1] == [0] and result["keyframeFlagIndexes"] == key_idx and _forced_keyframe_ok(key_idx) \
+        and config is not None and config.get("codec") == VP9_CODEC and "format" not in config
     return result
 
 
