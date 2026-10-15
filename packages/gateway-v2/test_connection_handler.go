@@ -198,8 +198,12 @@ func doWebAppConnectionTest(ctx context.Context, target rpcTarget, params webApp
 	if !strings.EqualFold(target.host, host) {
 		return fmt.Errorf("URL host does not match the signed target")
 	}
-	if port := u.Port(); port != "" && port != strconv.Itoa(target.port) {
-		return fmt.Errorf("URL port does not match the signed target")
+	dialPort := target.port
+	if port := u.Port(); port != "" {
+		dialPort, err = strconv.Atoi(port)
+		if err != nil || !target.allows(dialPort) {
+			return fmt.Errorf("URL port does not match the signed target")
+		}
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
@@ -216,7 +220,7 @@ func doWebAppConnectionTest(ctx context.Context, target rpcTarget, params webApp
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(target.host, strconv.Itoa(target.port)))
+			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(target.host, strconv.Itoa(dialPort)))
 		},
 	}
 	client := &http.Client{Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -227,7 +231,7 @@ func doWebAppConnectionTest(ctx context.Context, target rpcTarget, params webApp
 		return fmt.Errorf("build request: %w", err)
 	}
 	switch params.AuthMethod {
-	case "none", "":
+	case "none", "", "form-login":
 	case "header":
 		switch params.HeaderScheme {
 		case "basic":

@@ -72,7 +72,9 @@ func resolveSettings(in *api.PAMWebAppSettings) settings {
 		s.idleTimeoutMinutes = *in.IdleTimeoutMinutes
 	}
 	if in.BodyCapBytes != nil {
-		s.bodyCapBytes = *in.BodyCapBytes
+		if *in.BodyCapBytes > 0 {
+			s.bodyCapBytes = *in.BodyCapBytes
+		}
 	}
 	s.maskedHeaders = in.MaskedHeaders
 	s.maskedQueryParams = in.MaskedQueryParams
