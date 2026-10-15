@@ -11,6 +11,8 @@ const (
 	endAdminTerminated = "admin_terminated"
 	endViewerLost      = "viewer_lost"
 	endRecordingFailed = "recording_failed"
+	endIdle            = "idle"
+	endGatewayShutdown = "gateway_shutdown"
 )
 
 // AGENT_CONTROL kinds (gateway -> agent).
