@@ -436,9 +436,14 @@ const helloJSON = `{"protocol":1,"client":"test","decoders":{"vp9":false,"h264":
 // startSession runs a session to session_ready and the first keyframe; it returns the viewer and the done channel.
 func startSession(t *testing.T, h *harness, p SessionParams) (*viewerSide, *fakeAgent, chan error) {
 	t.Helper()
+	return startSessionCtx(t, context.Background(), h, p)
+}
+
+func startSessionCtx(t *testing.T, ctx context.Context, h *harness, p SessionParams) (*viewerSide, *fakeAgent, chan error) {
+	t.Helper()
 	gwSide, viewerConn := net.Pipe()
 	done := make(chan error, 1)
-	go func() { done <- h.svc.HandleSession(context.Background(), gwSide, p) }()
+	go func() { done <- h.svc.HandleSession(ctx, gwSide, p) }()
 	v := newViewer(viewerConn)
 	v.send(t, contract.FrameHello, []byte(helloJSON))
 	require.Equal(t, contract.ControlSessionReady, v.nextControl(t).Kind)
@@ -669,4 +674,94 @@ func TestEgressTunnelOnlyFallback(t *testing.T) {
 	h.sup.mu.Unlock()
 	require.Equal(t, "app-ca-pem", caPem)
 	v.endSession(t, done)
+}
+
+// endEvents returns the recorded session_end reasons after the session finished.
+func endEvents(t *testing.T, h *harness, done chan error) []string {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("session did not end")
+	}
+	res, err := h.backend.Verify(h.key, hSession, h.svc.RecordingPublicKey())
+	require.NoError(t, err)
+	var reasons []string
+	for _, ev := range res.ByType(contract.EventSessionEnd) {
+		var end map[string]any
+		require.NoError(t, json.Unmarshal(ev.Body, &end))
+		reasons = append(reasons, end["reason"].(string))
+	}
+	require.Equal(t, contract.EventSessionEnd, res.Events[len(res.Events)-1].Type, "session_end is the last event")
+	return reasons
+}
+
+func (v *viewerSide) waitEnding(t *testing.T) string {
+	t.Helper()
+	for {
+		f := v.next(t)
+		if f.Type != contract.FrameControl {
+			continue
+		}
+		var c contract.ControlDown
+		require.NoError(t, json.Unmarshal(f.Payload, &c))
+		if c.Kind == contract.ControlSessionEnding {
+			return c.Reason
+		}
+	}
+}
+
+// PAM_CANCELLATION cancels the session context; a second cancellation (or a later shutdown) changes nothing.
+func TestCancelTwiceEndsOnce(t *testing.T) {
+	h := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	v, _, done := startSessionCtx(t, ctx, h, h.params())
+	cancel()
+	cancel()
+	require.Equal(t, endAdminTerminated, v.waitEnding(t))
+	require.Equal(t, []string{endAdminTerminated}, endEvents(t, h, done))
+	h.svc.Close()
+	h.sup.mu.Lock()
+	defer h.sup.mu.Unlock()
+	require.Equal(t, 1, h.sup.destroyed, "runner destroyed exactly once")
+}
+
+// A gateway shutdown ends every live session with the gateway_shutdown tombstone and refuses new sessions.
+func TestGatewayShutdownTombstone(t *testing.T) {
+	h := newHarness(t)
+	v, _, done := startSession(t, h, h.params())
+	go h.svc.Close()
+	require.Equal(t, endGatewayShutdown, v.waitEnding(t))
+	require.Equal(t, []string{endGatewayShutdown}, endEvents(t, h, done))
+	h.sup.mu.Lock()
+	require.Equal(t, 1, h.sup.destroyed)
+	h.sup.mu.Unlock()
+
+	gwSide, viewerConn := net.Pipe()
+	defer viewerConn.Close()
+	errCh := make(chan error, 1)
+	go func() { errCh <- h.svc.HandleSession(context.Background(), gwSide, h.params()) }()
+	nv := newViewer(viewerConn)
+	nv.send(t, contract.FrameHello, []byte(helloJSON))
+	c := nv.nextControl(t)
+	require.Equal(t, contract.ControlError, c.Kind)
+	require.Equal(t, contract.ErrCodeRunnerUnavailable, c.Code)
+	require.Error(t, <-errCh)
+}
+
+// No user input for idleTimeoutMinutes ends the session with idle; input resets the timer.
+func TestIdleTimeout(t *testing.T) {
+	idleTimeoutUnit = 1500 * time.Millisecond
+	defer func() { idleTimeoutUnit = time.Minute }()
+	h := newHarness(t)
+	p := h.params()
+	one := 1
+	p.Credentials.WebApp.Settings = &api.PAMWebAppSettings{IdleTimeoutMinutes: &one}
+	v, _, done := startSession(t, h, p)
+	start := time.Now()
+	time.Sleep(1200 * time.Millisecond) // without the reset the session would end by 2.5 s (1.5 s + one 1 s tick)
+	v.send(t, contract.FrameInput, []byte(`{"events":[{"t":"key","action":"down","code":"KeyA","key":"a","mods":0,"repeat":false,"ts":1}]}`))
+	require.Equal(t, endIdle, v.waitEnding(t))
+	require.GreaterOrEqual(t, time.Since(start), 2600*time.Millisecond, "the input reset the idle timer")
+	require.Equal(t, []string{endIdle}, endEvents(t, h, done))
 }

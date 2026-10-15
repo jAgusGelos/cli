@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Infisical/infisical-merge/packages/api"
@@ -110,6 +111,7 @@ var (
 	timeLeftPeriod        = 60 * time.Second
 	timeLeftFinalPeriod   = 10 * time.Second
 	timeLeftFinalInterval = time.Minute
+	idleTimeoutUnit       = time.Minute // idleTimeoutMinutes is in these units
 )
 
 // liveSession is the per-session runtime: the current viewer and agent links, the recorder and the end-once latch.
@@ -124,6 +126,8 @@ type liveSession struct {
 	ready   chan struct{} // closed once the session is ready for a viewer
 	endOnce sync.Once
 	endCh   chan struct{}
+	// lastInput is the arrival time (unix ns) of the last kept user input; the idle timer runs from it.
+	lastInput atomic.Int64
 
 	mu             sync.Mutex
 	endReason      string
@@ -257,7 +261,12 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 		s.mu.Unlock()
 		return fail(contract.ErrCodeSessionInUse, errors.New("webapp: session already running"))
 	}
+	if s.shuttingDown.Load() {
+		s.mu.Unlock()
+		return fail(contract.ErrCodeRunnerUnavailable, errors.New("webapp: gateway shutting down"))
+	}
 	s.live[p.SessionID] = ls
+	s.sessions.Add(1)
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -266,6 +275,7 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 		}
 		s.mu.Unlock()
 		ls.end(ls.reason())
+		s.sessions.Done()
 	}()
 
 	token, err := supervisor.NewRunnerToken()
@@ -349,8 +359,11 @@ func (ls *liveSession) serve(ctx context.Context, vl *viewerLink, hello contract
 	case agent = <-pending.links:
 	case <-time.After(ls.svc.cfg.AgentWaitTimeout):
 		return fail(contract.ErrCodeRunnerUnavailable, errAgentTimeout)
+	case <-ls.endCh: // gateway shutdown before the runner agent connected
+		vl.control(contract.ControlDown{Kind: contract.ControlSessionEnding, Reason: ls.reason()})
+		return nil
 	case <-ctx.Done():
-		ls.end(endReasonForCancel(ls.p.ExpiresAt))
+		ls.end(ls.cancelReason())
 		return ctx.Err()
 	}
 	ls.mu.Lock()
@@ -378,13 +391,14 @@ func (ls *liveSession) serve(ctx context.Context, vl *viewerLink, hello contract
 	go ls.readAgent(agent)
 	go ls.watchAgentLinks(pending)
 
+	ls.lastInput.Store(time.Now().UnixNano())
 	ls.attachViewer(vl, ls.p.OnActivity, true)
 	close(ls.ready)
 
 	select {
 	case <-ls.endCh:
 	case <-ctx.Done():
-		ls.end(endReasonForCancel(ls.p.ExpiresAt))
+		ls.end(ls.cancelReason())
 	}
 	reason := ls.reason()
 	if v := ls.currentViewer(); v != nil {
@@ -628,6 +642,10 @@ func (ls *liveSession) ticker(done chan struct{}) {
 				nextTimeLeft = now.Add(period)
 			}
 			ls.maybeClearDegraded(now)
+			if ls.idleExpired(now) {
+				ls.log.Info().Int("idleTimeoutMinutes", ls.cfg.idleTimeoutMinutes).Msg("Web App session idle")
+				ls.end(endIdle)
+			}
 		}
 	}
 }
@@ -676,6 +694,24 @@ func shortID(id string) string {
 		return id[:8]
 	}
 	return id
+}
+
+// cancelReason is the end reason of a cancelled session context: a gateway shutdown, the expiry, or an
+// administrator's PAM_CANCELLATION.
+func (ls *liveSession) cancelReason() string {
+	if ls.svc.shuttingDown.Load() {
+		return endGatewayShutdown
+	}
+	return endReasonForCancel(ls.p.ExpiresAt)
+}
+
+// idleExpired reports whether no user input arrived for the template idleTimeoutMinutes (CONTRACTS.md 8.3).
+func (ls *liveSession) idleExpired(now time.Time) bool {
+	if ls.cfg.idleTimeoutMinutes <= 0 {
+		return false
+	}
+	last := ls.lastInput.Load()
+	return last != 0 && now.Sub(time.Unix(0, last)) >= time.Duration(ls.cfg.idleTimeoutMinutes)*idleTimeoutUnit
 }
 
 func endReasonForCancel(expiresAt time.Time) string {
@@ -766,6 +802,7 @@ func (ls *liveSession) handleInput(vl *viewerLink, f *contract.Frame, arrival ti
 	if len(kept) == 0 {
 		return
 	}
+	ls.lastInput.Store(arrival.UnixNano())
 	a := ls.currentAgent()
 	if a == nil {
 		return

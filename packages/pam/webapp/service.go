@@ -115,7 +115,14 @@ type Service struct {
 	agentLn  net.Listener
 	proxyLn  net.Listener
 	stopOnce sync.Once
+
+	// shuttingDown is set (under mu) by Close; sessions then end with gateway_shutdown and no new one starts.
+	shuttingDown atomic.Bool
+	sessions     sync.WaitGroup // owner sessions still running; Add under mu while not shutting down
 }
+
+// shutdownDrainTimeout bounds how long Close waits for live sessions to seal their recording.
+var shutdownDrainTimeout = 15 * time.Second
 
 // NewService loads (or creates) the recording key and prints its fingerprint. Listeners bind in Start.
 func NewService(cfg Config, apiClient *resty.Client) (*Service, error) {
@@ -242,17 +249,34 @@ func (s *Service) Ready(ctx context.Context) bool {
 	return s.state.Load() == stateReady
 }
 
-// Close stops the listeners.
+// Close runs at gateway shutdown: it stops the listeners, ends every live session with gateway_shutdown (each one
+// records its session_end, seals its last E chunk and destroys its runner) and waits for them, bounded by
+// shutdownDrainTimeout.
 func (s *Service) Close() {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
+		s.shuttingDown.Store(true)
 		if s.agentLn != nil {
 			s.agentLn.Close()
 		}
 		if s.proxyLn != nil {
 			s.proxyLn.Close()
 		}
+		live := make([]*liveSession, 0, len(s.live))
+		for _, ls := range s.live {
+			live = append(live, ls)
+		}
 		s.mu.Unlock()
+		for _, ls := range live {
+			ls.end(endGatewayShutdown)
+		}
+		drained := make(chan struct{})
+		go func() { s.sessions.Wait(); close(drained) }()
+		select {
+		case <-drained:
+		case <-time.After(shutdownDrainTimeout):
+			s.log.Warn().Int("sessions", len(live)).Msg("Web App sessions still closing at gateway shutdown")
+		}
 	})
 }
 
