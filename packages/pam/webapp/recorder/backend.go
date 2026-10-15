@@ -133,12 +133,12 @@ func (b *HTTPBackend) post(ctx context.Context, op, path string, body, out any) 
 }
 
 func (b *HTTPBackend) Open(ctx context.Context, req OpenRequest) error {
-	return b.post(ctx, "open", "open", req, nil)
+	return b.post(ctx, opOpen, "open", req, nil)
 }
 
 func (b *HTTPBackend) Presign(ctx context.Context, req PresignRequest) (*PresignResponse, error) {
 	var out PresignResponse
-	if err := b.post(ctx, "presign", "objects/presign", req, &out); err != nil {
+	if err := b.post(ctx, opPresign, "objects/presign", req, &out); err != nil {
 		return nil, err
 	}
 	if out.URL == "" {
@@ -148,11 +148,11 @@ func (b *HTTPBackend) Presign(ctx context.Context, req PresignRequest) (*Presign
 }
 
 func (b *HTTPBackend) SubmitCheckpoint(ctx context.Context, req CheckpointRequest) error {
-	return b.post(ctx, "checkpoint", "checkpoints", req, nil)
+	return b.post(ctx, opCheckpoint, "checkpoints", req, nil)
 }
 
 func (b *HTTPBackend) End(ctx context.Context, req EndRequest) error {
-	return b.post(ctx, "end", "end", req, nil)
+	return b.post(ctx, opEnd, "end", req, nil)
 }
 
 func (b *HTTPBackend) Put(ctx context.Context, p *PresignResponse, stored []byte) (string, error) {
@@ -183,7 +183,7 @@ func PutPresigned(ctx context.Context, client *http.Client, p *PresignResponse, 
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", &APIError{Op: "put", Status: resp.StatusCode, Body: truncate(string(body), 512)}
+		return "", &APIError{Op: opPut, Status: resp.StatusCode, Body: truncate(string(body), 512)}
 	}
 	return resp.Header.Get("x-amz-version-id"), nil
 }

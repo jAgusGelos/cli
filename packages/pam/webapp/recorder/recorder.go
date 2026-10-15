@@ -12,12 +12,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Infisical/infisical-merge/packages/pam/session"
 	"github.com/Infisical/infisical-merge/packages/pam/webapp/contract"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -31,6 +33,34 @@ const HeartbeatInterval = 30 * time.Second
 
 // DefaultMaxBacklog is the per-session upload queue limit before V objects count as loss (CONTRACTS.md 4.3).
 const DefaultMaxBacklog = 256 * 1024 * 1024
+
+const (
+	sessionKeyBytes       = 32
+	queueCapacity         = 4096
+	uploadAttempts        = 3
+	endCheckpointAttempts = 5
+	defaultRetryDelay     = time.Second
+	defaultMaskingPolicy  = 1
+	signerValidityExtra   = time.Hour
+
+	lossReasonUploadBacklog = "upload_backlog"
+)
+
+// Upload operations, as logged and as named in withRetry's 404 tolerance.
+const (
+	opOpen       = "open"
+	opPresign    = "presign"
+	opPut        = "put"
+	opCheckpoint = "checkpoint"
+	opEnd        = "end"
+)
+
+// objectKindNames are the presign kinds per checkpoint kind (CONTRACTS.md 6.8).
+var objectKindNames = map[contract.CheckpointKind]string{
+	contract.KindEvents:     "events",
+	contract.KindVideoInit:  "init",
+	contract.KindVideoMedia: "media",
+}
 
 var ErrClosed = errors.New("recorder: closed")
 
@@ -181,7 +211,7 @@ type Recorder struct {
 }
 
 func New(o Options) (*Recorder, error) {
-	if len(o.SessionKey) != 32 {
+	if len(o.SessionKey) != sessionKeyBytes {
 		return nil, fmt.Errorf("recorder: session key must be 32 bytes, got %d", len(o.SessionKey))
 	}
 	if o.Backend == nil || o.RecordingKey == nil {
@@ -191,20 +221,20 @@ func New(o Options) (*Recorder, error) {
 		o.Now = time.Now
 	}
 	if o.Retry == 0 {
-		o.Retry = time.Second
+		o.Retry = defaultRetryDelay
 	}
 	if o.MaxBacklog == 0 {
 		o.MaxBacklog = DefaultMaxBacklog
 	}
 	if o.MaskingPolicyVersion == 0 {
-		o.MaskingPolicyVersion = 1
+		o.MaskingPolicyVersion = defaultMaskingPolicy
 	}
 	id, err := uuid.Parse(o.SessionID)
 	if err != nil {
 		return nil, fmt.Errorf("recorder: session id: %w", err)
 	}
 	now := o.Now()
-	signer, err := NewSessionSigner(o.RecordingKey, o.SessionID, now, o.ExpiresAt.Add(time.Hour))
+	signer, err := NewSessionSigner(o.RecordingKey, o.SessionID, now, o.ExpiresAt.Add(signerValidityExtra))
 	if err != nil {
 		return nil, err
 	}
@@ -218,14 +248,11 @@ func New(o Options) (*Recorder, error) {
 		log:         o.Log,
 		chain:       contract.NewChain(),
 		initIndex:   -1,
-		queue:       make(chan job, 4096),
+		queue:       make(chan job, queueCapacity),
 		done:        make(chan struct{}),
 		warned:      map[string]bool{},
 	}, nil
 }
-
-// Signer exposes the session public key and KeyCert (for tests and the backend open call).
-func (r *Recorder) Signer() *SessionSigner { return r.signer }
 
 // Open records session_open (seq 0) and starts the uploader. The first upload job registers the keys with the backend.
 func (r *Recorder) Open(info SessionOpen) error {
@@ -241,7 +268,7 @@ func (r *Recorder) Open(info SessionOpen) error {
 	r.lastBeat = r.openWall
 	info.SessionID = r.o.SessionID
 	info.ProjectID = r.o.ProjectID
-	info.ResourceType = "web-app"
+	info.ResourceType = session.ResourceTypeWebApp
 	info.RecordingKey = RecordingInfo{
 		KeyID:       contract.KeyIDHex(recPub),
 		Fingerprint: contract.Fingerprint(recPub),
@@ -321,16 +348,6 @@ func (r *Recorder) sealIfDueLocked() error {
 	return r.sealEventsLocked()
 }
 
-// FlushEvents seals the pending events into an E chunk now (also called by the 10 s ticker).
-func (r *Recorder) FlushEvents() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil
-	}
-	return r.sealEventsLocked()
-}
-
 // Tick records the 30 s heartbeat when due and seals an E chunk when the 10 s window elapsed.
 func (r *Recorder) Tick() error {
 	r.mu.Lock()
@@ -379,7 +396,7 @@ func (r *Recorder) backlogFullLocked(size int, fromUs, toUs int64) (bool, error)
 	if r.queued.Load()+int64(size) <= r.o.MaxBacklog {
 		return false, nil
 	}
-	if _, err := r.appendLocked(contract.EventLoss, LossBody{Stream: "V", FromUs: fromUs, ToUs: toUs, Count: 1, Reason: "upload_backlog"}, r.o.Now()); err != nil {
+	if _, err := r.appendLocked(contract.EventLoss, LossBody{Stream: contract.SeriesV.Letter(), FromUs: fromUs, ToUs: toUs, Count: 1, Reason: lossReasonUploadBacklog}, r.o.Now()); err != nil {
 		return true, err
 	}
 	if !r.overflowed {
@@ -443,15 +460,25 @@ func (r *Recorder) persistLocked() {
 	if r.o.StatePath == "" {
 		return
 	}
+	if err := r.writeStateLocked(); err != nil {
+		r.log.Warn().Err(err).Str("path", r.o.StatePath).Msg("Web App recorder chain state not persisted")
+	}
+}
+
+func (r *Recorder) writeStateLocked() error {
 	head := r.chain.Head()
-	b, _ := json.Marshal(chainState{NextSeq: r.chain.NextSeq(), Head: hex.EncodeToString(head[:]), ENext: r.eNext, VNext: r.vNext})
+	b, err := json.Marshal(chainState{NextSeq: r.chain.NextSeq(), Head: hex.EncodeToString(head[:]), ENext: r.eNext, VNext: r.vNext})
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(r.o.StatePath), 0o700); err != nil {
-		return
+		return err
 	}
 	tmp := r.o.StatePath + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		_ = os.Rename(tmp, r.o.StatePath)
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
 	}
+	return os.Rename(tmp, r.o.StatePath)
 }
 
 // RecInit turns a REC_INIT into a V init object and its v_init event (CONTRACTS.md 6.6).
@@ -461,7 +488,8 @@ func (r *Recorder) RecInit(meta contract.RecInitMeta, body []byte) error {
 	if !r.opened || r.closed {
 		return ErrClosed
 	}
-	if full, err := r.backlogFullLocked(len(body), r.o.Now().Sub(r.openWall).Microseconds(), r.o.Now().Sub(r.openWall).Microseconds()); full || err != nil {
+	nowUs := r.o.Now().Sub(r.openWall).Microseconds()
+	if full, err := r.backlogFullLocked(len(body), nowUs, nowUs); full || err != nil {
 		return err
 	}
 	sum := sha256.Sum256(body)
@@ -566,10 +594,10 @@ func (r *Recorder) uploader() {
 	for j := range r.queue {
 		switch {
 		case j.open != nil:
-			r.withRetry("open", func() error { return r.o.Backend.Open(ctx, *j.open) })
+			r.withRetry(opOpen, func() error { return r.o.Backend.Open(ctx, *j.open) })
 		case j.end != nil:
 			// The end call follows the last checkpoint: resubmit what the backend refused first.
-			for attempt := 0; attempt < 5 && len(r.cpBacklog) > 0; attempt++ {
+			for attempt := 0; attempt < endCheckpointAttempts && len(r.cpBacklog) > 0; attempt++ {
 				if attempt > 0 {
 					time.Sleep(r.o.Retry)
 				}
@@ -578,7 +606,7 @@ func (r *Recorder) uploader() {
 			if len(r.cpBacklog) > 0 {
 				r.log.Error().Int("checkpoints", len(r.cpBacklog)).Msg("Web App checkpoints still refused at session end")
 			}
-			r.withRetry("end", func() error { return r.o.Backend.End(ctx, *j.end) })
+			r.withRetry(opEnd, func() error { return r.o.Backend.End(ctx, *j.end) })
 		default:
 			r.uploadObject(ctx, j)
 			r.queued.Add(-int64(len(j.stored)))
@@ -590,7 +618,7 @@ func (r *Recorder) uploader() {
 // must reach the backend in objectIndex order, CONTRACTS.md 6.9).
 func (r *Recorder) flushCheckpoints(ctx context.Context) {
 	for len(r.cpBacklog) > 0 {
-		if err := r.o.Backend.SubmitCheckpoint(ctx, r.cpBacklog[0]); err != nil && statusOf(err) != 404 {
+		if err := r.o.Backend.SubmitCheckpoint(ctx, r.cpBacklog[0]); err != nil && statusOf(err) != http.StatusNotFound {
 			r.log.Warn().Err(err).Msg("Web App checkpoint resubmission refused")
 			return
 		}
@@ -599,10 +627,10 @@ func (r *Recorder) flushCheckpoints(ctx context.Context) {
 }
 
 func (r *Recorder) uploadObject(ctx context.Context, j job) {
-	kind := map[contract.CheckpointKind]string{contract.KindEvents: "events", contract.KindVideoInit: "init", contract.KindVideoMedia: "media"}[j.kind]
+	kind := objectKindNames[j.kind]
 	ctSum := sha256.Sum256(j.stored)
 	var presigned *PresignResponse
-	if !r.withRetry("presign", func() error {
+	if !r.withRetry(opPresign, func() error {
 		p, err := r.o.Backend.Presign(ctx, PresignRequest{
 			Series: j.series.Letter(), ObjectIndex: j.index, Kind: kind,
 			CiphertextBytes: len(j.stored), CiphertextSha256: base64.StdEncoding.EncodeToString(ctSum[:]),
@@ -613,7 +641,7 @@ func (r *Recorder) uploadObject(ctx context.Context, j job) {
 		return
 	}
 	var versionID string
-	if !r.withRetry("put", func() error {
+	if !r.withRetry(opPut, func() error {
 		v, err := r.o.Backend.Put(ctx, presigned, j.stored)
 		if errors.Is(err, ErrPreconditionFailed) {
 			r.log.Warn().Str("series", j.series.Letter()).Uint32("objectIndex", j.index).Msg("Web App object already exists, submitting checkpoint anyway")
@@ -636,16 +664,16 @@ func (r *Recorder) uploadObject(ctx context.Context, j job) {
 		r.cpBacklog = append(r.cpBacklog, req)
 		return
 	}
-	if !r.withRetry("checkpoint", func() error { return r.o.Backend.SubmitCheckpoint(ctx, req) }) {
+	if !r.withRetry(opCheckpoint, func() error { return r.o.Backend.SubmitCheckpoint(ctx, req) }) {
 		r.cpBacklog = append(r.cpBacklog, req)
 	}
 }
 
-// withRetry runs fn up to 3 times on network errors and 5xx. A 404 on open, checkpoint or end is tolerated with one
+// withRetry runs fn up to uploadAttempts times on network errors and 5xx. A 404 on open, checkpoint or end is tolerated with one
 // warning per operation (the backend may land its routes in stages); other 4xx are logged as errors.
 func (r *Recorder) withRetry(op string, fn func() error) bool {
 	var err error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < uploadAttempts; attempt++ {
 		if attempt > 0 {
 			time.Sleep(r.o.Retry)
 		}
@@ -654,11 +682,11 @@ func (r *Recorder) withRetry(op string, fn func() error) bool {
 			return true
 		}
 		status := statusOf(err)
-		if status == 404 && op != "presign" && op != "put" {
+		if status == http.StatusNotFound && op != opPresign && op != opPut {
 			r.warnOnce(op, err)
 			return true
 		}
-		if status >= 400 && status < 500 {
+		if status >= http.StatusBadRequest && status < http.StatusInternalServerError {
 			break
 		}
 	}
