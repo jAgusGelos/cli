@@ -71,7 +71,7 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(inputs[0]["events"][0]["t"], "move")
         hello = gw.received[0].json()
         self.assertEqual(hello["encoderMode"], "dual")
-        self.assertEqual(hello["liveCodecs"], ["h264"])
+        self.assertEqual(hello["liveCodecs"], ["vp9", "h264"])
         self.assertEqual(hello["recordingCodec"], "h264")
         self.assertEqual(hello["imageDigest"], CFG.image_digest)
         self.assertEqual(hello["display"], {"width": 1280, "height": 720, "framerate": 30})

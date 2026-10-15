@@ -1,7 +1,12 @@
 """INPUT_INJECT to XTest (AD-9). The mapping helpers are pure; Xlib is imported only by XInjector."""
 import threading
+import time
 
 WHEEL_STEP_PX = 40
+SHIFT_L = 0xFFE1
+REMAP_SETTLE_S = 0.05
+US_SHIFTED = '~!@#$%^&*()_+{}|:"<>?'
+TEXT_CONTROL = {"\n": 0xFF0D, "\t": 0xFF09}
 
 _NAMED = {
     "Enter": 0xFF0D, "NumpadEnter": 0xFF8D, "Tab": 0xFF09, "Backspace": 0xFF08, "Escape": 0xFF1B,
@@ -54,6 +59,23 @@ def keysym_for(code, key):
     return None
 
 
+def text_keysyms(text):
+    """Keystrokes for typed text: list of (keysym, shift) on a US layout. Shift is a hint for ASCII; the injector
+    uses the live keymap level when the keysym is mapped. Carriage returns are dropped (CRLF types one Enter)."""
+    out = []
+    for ch in text:
+        if ch == "\r":
+            continue
+        if ch in TEXT_CONTROL:
+            out.append((TEXT_CONTROL[ch], False))
+            continue
+        cp = ord(ch)
+        if cp < 0x20 or cp == 0x7F:
+            continue
+        out.append((char_keysym(ch), ("A" <= ch <= "Z") or ch in US_SHIFTED))
+    return out
+
+
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
@@ -84,7 +106,8 @@ class InputState:
         self.enabled = True
         self.acc_x = 0.0
         self.acc_y = 0.0
-        self.counts = {"injected": 0, "dropped_disabled": 0, "unknown": 0, "unmapped_key": 0}
+        self.counts = {"injected": 0, "dropped_disabled": 0, "unknown": 0, "unmapped_key": 0, "typed_chars": 0,
+                       "remapped_chars": 0}
 
     def point(self, ev):
         x = clamp(int(ev.get("x", 0)), 0, self.width - 1)
@@ -108,6 +131,11 @@ class XInjector:
         self._log = log or (lambda *a, **k: None)
         self._keys_down = set()
         self._buttons_down = set()
+        self._spare = None
+
+    def release_all(self):
+        with self._lock:
+            self._release_all()
 
     def set_enabled(self, enabled):
         with self._lock:
@@ -175,7 +203,66 @@ class XInjector:
             else:
                 xt.fake_input(d, X.KeyRelease, kc)
                 self._keys_down.discard(kc)
+        elif t in ("ime", "paste"):
+            text = ev.get("text")
+            if not isinstance(text, str):
+                raise ValueError("text must be a string")
+            self._type_text(text)
         else:
             st.counts["unknown"] += 1
             return
         st.counts["injected"] += 1
+
+    def _spare_keycode(self):
+        """A keycode with no keysyms, borrowed for characters the keymap does not have."""
+        if self._spare is None:
+            d = self._d
+            lo, hi = d.display.info.min_keycode, d.display.info.max_keycode
+            mapping = d.get_keyboard_mapping(lo, hi - lo + 1)
+            for i in range(len(mapping) - 1, -1, -1):
+                if not any(mapping[i]):
+                    self._spare = (lo + i, list(mapping[i]))
+                    break
+            else:
+                self._spare = (hi, list(mapping[-1]))
+        return self._spare
+
+    def _tap(self, kc, shift):
+        X, xt, d = self._X, self._xtest, self._d
+        shift_kc = d.keysym_to_keycode(SHIFT_L) if shift else 0
+        if shift_kc:
+            xt.fake_input(d, X.KeyPress, shift_kc)
+        xt.fake_input(d, X.KeyPress, kc)
+        xt.fake_input(d, X.KeyRelease, kc)
+        if shift_kc:
+            xt.fake_input(d, X.KeyRelease, shift_kc)
+
+    def _type_text(self, text):
+        d, st = self._d, self.state
+        remapped = None
+        try:
+            for ks, _shift_hint in text_keysyms(text):
+                levels = [(kc, idx) for kc, idx in d.keysym_to_keycodes(ks) if idx in (0, 1)]
+                if levels:
+                    kc, idx = min(levels, key=lambda p: p[1])
+                    self._tap(kc, idx == 1)
+                else:
+                    spare_kc, original = self._spare_keycode()
+                    if remapped != ks:
+                        if remapped is not None:
+                            d.sync()
+                            time.sleep(REMAP_SETTLE_S)
+                        # Same keysym on every level so the Shift state does not matter.
+                        d.change_keyboard_mapping(spare_kc, [tuple([ks] * max(2, len(original)))])
+                        d.sync()
+                        remapped = ks
+                    self._tap(spare_kc, False)
+                    st.counts["remapped_chars"] += 1
+                st.counts["typed_chars"] += 1
+        finally:
+            if remapped is not None:
+                d.sync()
+                time.sleep(REMAP_SETTLE_S)
+                spare_kc, original = self._spare
+                d.change_keyboard_mapping(spare_kc, [tuple(original)])
+                d.sync()

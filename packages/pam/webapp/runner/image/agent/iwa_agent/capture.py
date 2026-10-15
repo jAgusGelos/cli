@@ -125,3 +125,25 @@ class Capture:
             if container is not None:
                 container.close()
             self._log("capture_stopped", frames=self.frames)
+
+
+class StallDetector:
+    """Capture consumer: a gap of >= 1 s between captured frames is a capture stall. Reported once the stall ends
+    as `{fromPtsUs, toPtsUs, framesLost, reason:"capture_stall"}` on the capture PTS axis."""
+
+    def __init__(self, fps, emit, threshold_us=1_000_000):
+        self.frame_us = 1_000_000 // fps
+        self.fps = fps
+        self.emit = emit
+        self.threshold_us = threshold_us
+        self._last = None
+        self.stalls = 0
+
+    def offer(self, idx, pts_us, wall_ms, frame, raw_fn):
+        last, self._last = self._last, pts_us
+        if last is None or pts_us - last < self.threshold_us:
+            return
+        lost = max(1, round((pts_us - last) * self.fps / 1_000_000) - 1)
+        self.stalls += 1
+        self.emit({"fromPtsUs": last + self.frame_us, "toPtsUs": pts_us, "framesLost": lost,
+                   "reason": "capture_stall"})

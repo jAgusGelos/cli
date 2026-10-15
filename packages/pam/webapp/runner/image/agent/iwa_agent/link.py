@@ -1,4 +1,5 @@
 """Agent <-> gateway link (CONTRACTS 1 and 4): dial, handshake, framed send with one writer lock, reader dispatch."""
+import collections
 import socket
 import threading
 import time
@@ -150,7 +151,7 @@ def build_hello(cfg):
         "runnerToken": cfg.runner_token,
         "agentVersion": AGENT_VERSION,
         "imageDigest": cfg.image_digest,
-        "liveCodecs": ["h264"],
+        "liveCodecs": ["vp9", "h264"],
         "recordingCodec": "h264",
         "encoderMode": "dual",
         "display": {"width": cfg.width, "height": cfg.height, "framerate": cfg.fps},
@@ -158,20 +159,45 @@ def build_hello(cfg):
 
 
 class Outbox:
-    """Holds agent->gateway frames until the link is welcomed, then sends directly."""
+    """Agent->gateway frames. While no welcomed link is attached (before WELCOME, or after a link loss until the
+    reconnect is welcomed) buffered frames are kept: REC_SEGMENTs up to `backlog_us` of media (the oldest overflow
+    and are reported as one `REC_LOSS agent_restart` per contiguous range after the next WELCOME), other frames up to
+    `max_other`. Live frames (`buffer=False`) are dropped while detached."""
 
-    def __init__(self, log=None):
+    def __init__(self, log=None, backlog_us=60_000_000, max_other=512):
         self._lock = threading.Lock()
-        self._pending = []
+        self._pending = collections.deque()
         self._link = None
         self._log = log or (lambda *a, **k: None)
+        self.backlog_us = backlog_us
+        self.max_other = max_other
+        self._seg_us = 0
+        self._other = 0
+        self.lost = []
+        self.dropped_other = 0
 
     def attach(self, link):
+        """Send any overflow REC_LOSS, then the backlog in order. Returns False if the link failed meanwhile."""
         with self._lock:
-            pending, self._pending = self._pending, []
+            out = [(frames.REC_LOSS, frames.json_bytes(loss), 0, None) for loss in self.lost]
+            if self.lost:
+                self._log("outbox_backlog_overflow", ranges=len(self.lost),
+                          framesLost=sum(x["framesLost"] for x in self.lost))
+            self.lost = []
+            out += [item[:4] for item in self._pending]
+            self._pending.clear()
+            self._seg_us = self._other = 0
+            for k, item in enumerate(out):
+                try:
+                    link.send(*item)
+                except LinkError:
+                    for rest in out[k:]:
+                        self._buffer_locked(*rest)
+                    return False
             self._link = link
-            for ftype, payload, flags, ts in pending:
-                link.send(ftype, payload, flags, ts)
+            if out:
+                self._log("outbox_flushed", frames=len(out))
+            return True
 
     def detach(self):
         with self._lock:
@@ -186,12 +212,49 @@ class Outbox:
         """Returns True when sent or buffered."""
         with self._lock:
             link = self._link
-            if link is None:
-                if buffer:
-                    self._pending.append((ftype, payload, flags, timestamp_us))
-                return buffer
-        try:
-            link.send(ftype, payload, flags, timestamp_us)
-            return True
-        except LinkError:
-            return False
+            if link is not None and not link.closed.is_set():
+                try:
+                    link.send(ftype, payload, flags, timestamp_us)
+                    return True
+                except LinkError:
+                    self._link = None
+            else:
+                self._link = None
+            if buffer:
+                self._buffer_locked(ftype, payload, flags, timestamp_us)
+            return buffer
+
+    def _buffer_locked(self, ftype, payload, flags, ts):
+        dur = None
+        if ftype == frames.REC_SEGMENT:
+            meta, _ = frames.split_meta(payload)
+            dur = (meta["startPtsUs"], meta["endPtsUs"], meta["frameCount"])
+            self._seg_us += dur[1] - dur[0]
+        else:
+            self._other += 1
+        self._pending.append((ftype, payload, flags, ts, dur))
+        while self._seg_us > self.backlog_us:
+            self._drop_oldest_locked(lambda it: it[4] is not None)
+        while self._other > self.max_other:
+            self._drop_oldest_locked(lambda it: it[4] is None and it[0] not in (frames.REC_INIT, frames.REC_LOSS))
+
+    def _drop_oldest_locked(self, match):
+        for k, item in enumerate(self._pending):
+            if match(item):
+                del self._pending[k]
+                break
+        else:
+            self._other = min(self._other, self.max_other)
+            return
+        dur = item[4]
+        if dur is None:
+            self._other -= 1
+            self.dropped_other += 1
+            return
+        self._seg_us -= dur[1] - dur[0]
+        if self.lost and self.lost[-1]["toPtsUs"] == dur[0]:
+            self.lost[-1]["toPtsUs"] = dur[1]
+            self.lost[-1]["framesLost"] += dur[2]
+        else:
+            self.lost.append({"fromPtsUs": dur[0], "toPtsUs": dur[1], "framesLost": dur[2],
+                              "reason": "agent_restart"})

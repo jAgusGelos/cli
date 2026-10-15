@@ -18,8 +18,8 @@ go build -o /tmp/iwa/iwa-supervisor ./packages/pam/webapp/supervisor/cmd/iwa-sup
 go build -o /tmp/iwa/iwa-harness ./packages/pam/webapp/runner/harness
 ```
 
-Current image (M1, 2026-10-15 14:56):
-`infisical-webapp-runner@sha256:2f17c9aebe3787d0a34d5239acb7c06766518e64f1a4121db698cbc208986513`
+Current image (M2, 2026-10-15 15:05):
+`infisical-webapp-runner@sha256:dc93c13b56cd8c27605a7b7c94ca29d5bbd2b6824fdd87a10c8e3ae311122ee7`
 (Chromium `155.0.8059.79-1~deb13u1`, base `debian@sha256:04634311...0a28a`). Every rebuild changes the digest: refresh
 both env lines below.
 
@@ -31,9 +31,9 @@ digest (checked by the harness).
 
 ```bash
 # supervisor (demo only: a release build ships the allowlist of Infisical-published digests instead)
-INFISICAL_WEBAPP_RUNNER_IMAGES=infisical-webapp-runner@sha256:2f17c9aebe3787d0a34d5239acb7c06766518e64f1a4121db698cbc208986513
+INFISICAL_WEBAPP_RUNNER_IMAGES=infisical-webapp-runner@sha256:dc93c13b56cd8c27605a7b7c94ca29d5bbd2b6824fdd87a10c8e3ae311122ee7
 # gateway: the image ref it sends as `image` in POST /v1/runners
-INFISICAL_WEBAPP_RUNNER_IMAGE=infisical-webapp-runner@sha256:2f17c9aebe3787d0a34d5239acb7c06766518e64f1a4121db698cbc208986513
+INFISICAL_WEBAPP_RUNNER_IMAGE=infisical-webapp-runner@sha256:dc93c13b56cd8c27605a7b7c94ca29d5bbd2b6824fdd87a10c8e3ae311122ee7
 # both sides, optional override of /tmp/infisical-webapp/supervisor.sock
 INFISICAL_WEBAPP_SUPERVISOR_SOCKET=/tmp/infisical-webapp/supervisor.sock
 ```
@@ -75,6 +75,16 @@ Exit 0 means: agent handshake, live H.264 decoded, forced keyframe, recording in
 sha256 (H.264 High, IDR first), input seen by the demo app, netns check (`172.28.0.1:80/8080` and DNS fail, agent and
 proxy ports reachable), image pin, clean destroy, no runner token in any log. Outputs land in `-out`.
 
+Extra scenarios (each still runs the default checks):
+
+| Flag | What it adds |
+|---|---|
+| `-codec vp9` | `live_start vp9`: `VIDEO_CONFIG vp09.00.10.08`, VP9 frames written to `live.ivf` and decoded; recording stays H.264 |
+| `-lockdown` | Injects F12, Ctrl+Shift+I, Ctrl+N + typed `chrome://settings`, Shift+Esc, Ctrl+P and the rogue CRX link; frames and window lists per step, `watchdog_closed` events |
+| `-measure 60` | Wheel motion on the input page while sampling `docker stats` every 2 s; writes `measure.json` |
+| `-stall-test` | SIGSTOP Xvfb for 2 s; expects exactly one `REC_LOSS capture_stall` |
+| `-reconnect-test` | Drops the agent link mid-run; expects a re-dial, continued segment indexes and a new live epoch on `live_start` |
+
 ## Tests
 
 ```bash
@@ -88,7 +98,17 @@ python3 -m iwa_agent.selftest recorder
 
 ## Wire notes for F2
 
-- `VIDEO_CONFIG.codec` is derived from the live encoder's SPS: today `avc1.42C01F` (Constrained Baseline, level 3.1),
+- `AGENT_HELLO.liveCodecs` is `["vp9","h264"]`. VP9 live: `VIDEO_CONFIG {"codec":"vp09.00.10.08",...}` with no
+  `format`, one VP9 frame per `VIDEO_CHUNK`. Every `live_start` restarts the live encoder and bumps `epoch`;
+  `live_quality` does the same with the new bitrate; `live_pause`/`live_resume` stop and restart sending (resume starts
+  with a keyframe).
+- The X11 watchdog closes any extra top-level window (Task Manager, Ctrl+N windows) and sends
+  `AGENT_EVENT {"kind":"watchdog_closed","wmClass","wmName"}`.
+- `REC_LOSS capture_stall` after >= 1 s without captured frames. On link loss the agent keeps capturing and recording,
+  re-dials with the same token for 30 s (new `AGENT_HELLO`, `seq` from 0), re-sends up to 60 s of buffered segments,
+  and waits for a new `live_start`; after 30 s it exits 2.
+- `ime` and `paste` text is typed per character (Unicode through a temporary keysym remap).
+- `VIDEO_CONFIG.codec` for H.264 is derived from the live encoder's SPS: today `avc1.42C01F` (Constrained Baseline, level 3.1),
   Annex B, SPS/PPS before every IDR. The viewer must pass it through (CONTRACTS 1.6), not hardcode `avc1.42E01F`.
 - `REC_INIT.codec` comes from the init's `avcC` (`avc1.64001f`, High); `timescale` 90000; `ptsZeroUnixMs` set.
 - The agent sends `REC_*` only after `AGENT_WELCOME ok`; on `shutdown` it flushes the partial segment and exits 0.

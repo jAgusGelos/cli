@@ -1,6 +1,8 @@
-"""In-image encoder self tests against the running Xvfb :99. Usage: python3 -m iwa_agent.selftest live|recorder [outdir]"""
+"""In-image encoder self tests against the running Xvfb :99.
+Usage: python3 -m iwa_agent.selftest live|live-vp9|recorder [outdir]"""
 import json
 import os
+import struct
 import subprocess
 import sys
 import threading
@@ -8,7 +10,7 @@ import time
 
 from . import frames
 from .capture import Capture
-from .live import LiveEncoder, nal_types
+from .live import LiveEncoder, VP9LiveEncoder, nal_types
 from .recorder import Recorder
 
 W, H, FPS = 1280, 720, 30
@@ -81,6 +83,68 @@ def live_test(outdir):
     return result
 
 
+def write_ivf(path, payloads, fps):
+    """Minimal IVF container (VP90) so ffprobe can decode raw VP9 frames."""
+    with open(path, "wb") as f:
+        f.write(b"DKIF" + struct.pack("<HH4sHHIIII", 0, 32, b"VP90", W, H, fps, 1, len(payloads), 0))
+        for n, data in enumerate(payloads):
+            f.write(struct.pack("<IQ", len(data), n) + data)
+
+
+def live_vp9_test(outdir):
+    chunks = []
+    done = threading.Event()
+    force_at = 45
+
+    def emit(ftype, payload, flags, ts):
+        chunks.append((ftype, payload, flags, ts))
+        if sum(1 for c in chunks if c[0] == frames.VIDEO_CHUNK) >= 3 * FPS:
+            done.set()
+
+    cap = Capture(W, H, FPS, "selftest vp9 watermark", log=log)
+    live = VP9LiveEncoder(W, H, FPS, emit, epoch=2, log=log)
+    seen = [0]
+
+    def offer(idx, pts, wall, frame, raw_fn):
+        seen[0] += 1
+        if seen[0] == force_at + 1:
+            live.request_keyframe()
+        live.offer(idx, pts, wall, frame, raw_fn)
+
+    started = time.monotonic()
+    live.start()
+    cap.add_consumer(offer)
+    cap.start()
+    done.wait(15)
+    elapsed = time.monotonic() - started
+    cap.stop()
+    live.stop()
+    path = os.path.join(outdir, "selftest-live.ivf")
+    vchunks = [c for c in chunks if c[0] == frames.VIDEO_CHUNK]
+    write_ivf(path, [c[1] for c in vchunks], FPS)
+    probe = ffprobe_frames(path)
+    key_idx = [i for i, fr in enumerate(probe) if fr.get("key_frame") == 1]
+    flagged = [i for i, c in enumerate(vchunks) if c[2] & frames.FLAG_KEYFRAME]
+    config = json.loads(chunks[0][1]) if chunks and chunks[0][0] == frames.VIDEO_CONFIG else None
+    codec = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=codec_name,profile,pix_fmt", "-of", "json", path],
+                           capture_output=True, text=True).stdout
+    result = {
+        "test": "live-vp9", "file": path, "bytes": os.path.getsize(path), "chunks": len(vchunks),
+        "videoConfig": config, "stream": json.loads(codec or "{}").get("streams"), "ffprobeFrames": len(probe),
+        "size": f"{probe[0]['width']}x{probe[0]['height']}" if probe else None,
+        "firstPictType": probe[0]["pict_type"] if probe else None,
+        "keyframeIndexes": key_idx, "keyframeFlagIndexes": flagged, "forcedRequestedAtFrame": force_at,
+        "kbpsMeasured": round(sum(len(c[1]) for c in vchunks) * 8 / 1000 / max(elapsed, 0.001)),
+        "monotonicTimestamps": all(vchunks[i][3] < vchunks[i + 1][3] for i in range(len(vchunks) - 1)),
+    }
+    forced_ok = any(force_at <= k <= force_at + 2 for k in key_idx)
+    result["ok"] = bool(probe) and len(probe) == len(vchunks) and result["size"] == f"{W}x{H}" \
+        and key_idx[:1] == [0] and flagged == key_idx and forced_ok and config is not None \
+        and config.get("codec") == "vp09.00.10.08" and "format" not in config
+    return result
+
+
 def recorder_test(outdir, seconds=21):
     out = []
     rec = Recorder(W, H, FPS, 10, 26, 1500, emit=lambda t, p: out.append((t, p)), log=log)
@@ -121,12 +185,13 @@ def recorder_test(outdir, seconds=21):
 
 
 def main(argv):
-    if not argv or argv[0] not in ("live", "recorder"):
+    tests = {"live": live_test, "live-vp9": live_vp9_test, "recorder": recorder_test}
+    if not argv or argv[0] not in tests:
         print(__doc__, file=sys.stderr)
         return 2
     outdir = argv[1] if len(argv) > 1 else "/tmp/iwa/selftest"
     os.makedirs(outdir, exist_ok=True)
-    result = live_test(outdir) if argv[0] == "live" else recorder_test(outdir)
+    result = tests[argv[0]](outdir)
     print(json.dumps(result, indent=1))
     return 0 if result["ok"] else 1
 
