@@ -51,10 +51,12 @@ type Server struct {
 	FailOpen404 bool
 	// Fail412 makes the next PUT of this key answer 412.
 	Fail412 map[string]bool
+	// FailCheckpoint answers the next checkpoints of "E1", "V0", ... with these statuses (422 carries seq_gap).
+	FailCheckpoint map[string][]int
 }
 
 func NewServer(projectID, uploadToken string) *Server {
-	s := &Server{ProjectID: projectID, UploadToken: uploadToken, Objects: map[string][]byte{}, Fail412: map[string]bool{}}
+	s := &Server{ProjectID: projectID, UploadToken: uploadToken, Objects: map[string][]byte{}, Fail412: map[string]bool{}, FailCheckpoint: map[string][]int{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/pam/sessions/{id}/web-app/open", s.auth(s.open))
 	mux.HandleFunc("POST /v1/pam/sessions/{id}/web-app/objects/presign", s.auth(s.presign))
@@ -186,6 +188,29 @@ func (s *Server) checkpoint(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		return
+	}
+	id := cp.Series.Letter() + fmt.Sprint(cp.ObjectIndex)
+	if fails := s.FailCheckpoint[id]; len(fails) > 0 {
+		s.FailCheckpoint[id] = fails[1:]
+		s.record("refused:" + id)
+		w.WriteHeader(fails[0])
+		_ = json.NewEncoder(w).Encode(map[string]string{"code": "seq_gap"})
+		return
+	}
+	// E checkpoints must arrive in objectIndex order.
+	if cp.Series == contract.SeriesE {
+		want := uint32(0)
+		for _, c := range s.Checkpoints {
+			if c.Parsed.Series == contract.SeriesE {
+				want++
+			}
+		}
+		if cp.ObjectIndex != want {
+			s.record("seq_gap:" + id)
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": "seq_gap"})
+			return
+		}
 	}
 	s.Checkpoints = append(s.Checkpoints, Checkpoint{Raw: raw, Signature: sig, ObjectKey: req.ObjectKey, VersionID: req.VersionID, Parsed: cp})
 	s.record(fmt.Sprintf("checkpoint:%s%d", cp.Series.Letter(), cp.ObjectIndex))

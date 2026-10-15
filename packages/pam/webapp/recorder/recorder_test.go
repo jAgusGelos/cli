@@ -148,3 +148,70 @@ func TestRecorderTolerates404And412(t *testing.T) {
 	require.Contains(t, srv.Order, "end")
 	require.Empty(t, srv.Checkpoints, "404 checkpoints are tolerated, not retried forever")
 }
+
+func TestRecorderHeartbeatAndOrderedCheckpointRetry(t *testing.T) {
+	srv := recordertest.NewServer(testProject, "tok")
+	defer srv.Close()
+	srv.FailCheckpoint["E0"] = []int{500}
+	srv.FailCheckpoint["E1"] = []int{422}
+	clock := &fakeClock{t: time.UnixMilli(1760545800000)}
+	r, key, recKey := newTestRecorder(t, srv, clock)
+	r.o.ViewerConnected = func() bool { return false }
+	r.o.StatePath = filepath.Join(t.TempDir(), "state.json")
+	require.NoError(t, r.Open(SessionOpen{}))
+	for i := 0; i < 7; i++ { // 70 s: two heartbeats, several E chunks
+		clock.Add(10 * time.Second)
+		require.NoError(t, r.Tick())
+	}
+	_, err := os.Stat(r.o.StatePath)
+	require.NoError(t, err, "chain state persisted after a seal")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, r.Close(ctx, "user_end"))
+	_, err = os.Stat(r.o.StatePath)
+	require.True(t, os.IsNotExist(err), "state removed after a clean close")
+
+	res, err := srv.Verify(key, testSession, recKey.Public().(ed25519.PublicKey))
+	require.NoError(t, err, "all checkpoints accepted in order: %v", srv.Order)
+	require.Contains(t, srv.Order, "refused:E0")
+	require.Contains(t, srv.Order, "refused:E1")
+	beats := res.ByType(contract.EventHeartbeat)
+	require.Len(t, beats, 2)
+	var hb heartbeatBody
+	require.NoError(t, json.Unmarshal(beats[0].Body, &hb))
+	require.False(t, hb.ViewerConnected)
+	require.Equal(t, int64(30000), hb.UptimeMs)
+	require.Equal(t, beats[0].Seq-1, hb.LastSeq)
+	require.Equal(t, "end", srv.Order[len(srv.Order)-1])
+}
+
+func TestRecorderUploadBacklogLoss(t *testing.T) {
+	srv := recordertest.NewServer(testProject, "tok")
+	defer srv.Close()
+	clock := &fakeClock{t: time.Now()}
+	r, key, recKey := newTestRecorder(t, srv, clock)
+	overflow := make(chan struct{}, 2)
+	r.o.MaxBacklog = 10 // any V object overflows
+	r.o.OnOverflow = func() { overflow <- struct{}{} }
+	require.NoError(t, r.Open(SessionOpen{}))
+	require.NoError(t, r.RecInit(contract.RecInitMeta{Codec: contract.CodecStringH264Rec}, []byte("an init segment bigger than ten bytes")))
+	require.NoError(t, r.RecInit(contract.RecInitMeta{Codec: contract.CodecStringH264Rec}, []byte("another init segment over the limit")))
+	select {
+	case <-overflow:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnOverflow not called")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, r.Close(ctx, "recording_failed"))
+	require.Len(t, overflow, 0, "OnOverflow is called once")
+	res, err := srv.Verify(key, testSession, recKey.Public().(ed25519.PublicKey))
+	require.NoError(t, err)
+	require.Empty(t, res.VInits, "over-backlog V objects are not uploaded")
+	losses := res.ByType(contract.EventLoss)
+	require.Len(t, losses, 2)
+	var l LossBody
+	require.NoError(t, json.Unmarshal(losses[0].Body, &l))
+	require.Equal(t, "V", l.Stream)
+	require.Equal(t, "upload_backlog", l.Reason)
+}

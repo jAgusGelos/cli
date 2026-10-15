@@ -12,7 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Infisical/infisical-merge/packages/pam/webapp/contract"
@@ -22,6 +25,12 @@ import (
 
 // EChunkInterval is how often pending events are sealed into an E chunk (CONTRACTS.md 6.5).
 const EChunkInterval = 10 * time.Second
+
+// HeartbeatInterval is the lifecycle heartbeat period (CONTRACTS.md 5.6).
+const HeartbeatInterval = 30 * time.Second
+
+// DefaultMaxBacklog is the per-session upload queue limit before V objects count as loss (CONTRACTS.md 4.3).
+const DefaultMaxBacklog = 256 * 1024 * 1024
 
 var ErrClosed = errors.New("recorder: closed")
 
@@ -39,6 +48,16 @@ type Options struct {
 	Log   zerolog.Logger
 	// Retry is the delay between upload attempts (default 1 s).
 	Retry time.Duration
+	// ViewerConnected feeds heartbeat.viewerConnected. Nil: true.
+	ViewerConnected func() bool
+	// OnOverflow is called (once, on its own goroutine) when the upload backlog forced a V loss record; the session
+	// applies the template overflow policy.
+	OnOverflow func()
+	// MaxBacklog bounds the queued upload bytes (default 256 MiB).
+	MaxBacklog int64
+	// StatePath, when set, receives the chain state (next seq, head, object counters) after every seal, so a restart
+	// can tell where the chain stopped (CONTRACTS.md 6.2).
+	StatePath string
 }
 
 // SessionOpen is the session_open body (CONTRACTS.md 5.6). The recorder fills the key fields.
@@ -96,6 +115,21 @@ type vSegmentBody struct {
 	FramesDropped int    `json:"framesDropped"`
 }
 
+type heartbeatBody struct {
+	LastSeq         uint64 `json:"lastSeq"`
+	UptimeMs        int64  `json:"uptimeMs"`
+	ViewerConnected bool   `json:"viewerConnected"`
+}
+
+// LossBody is the lifecycle loss event (CONTRACTS.md 5.6); times on the session monotonic clock.
+type LossBody struct {
+	Stream string `json:"stream"`
+	FromUs int64  `json:"fromUs"`
+	ToUs   int64  `json:"toUs"`
+	Count  int    `json:"count"`
+	Reason string `json:"reason"`
+}
+
 type sessionEndBody struct {
 	Reason   string `json:"reason"`
 	FinalSeq uint64 `json:"finalSeq"`
@@ -135,11 +169,15 @@ type Recorder struct {
 	initIndex   int64 // -1 until the first REC_INIT
 	ptsZeroMs   int64
 	lastSeal    time.Time
+	lastBeat    time.Time
+	overflowed  bool
 
-	queue    chan job
-	done     chan struct{}
-	warned   map[string]bool
-	warnedMu sync.Mutex
+	queued    atomic.Int64
+	cpBacklog []CheckpointRequest // refused checkpoints, uploader goroutine only
+	queue     chan job
+	done      chan struct{}
+	warned    map[string]bool
+	warnedMu  sync.Mutex
 }
 
 func New(o Options) (*Recorder, error) {
@@ -154,6 +192,9 @@ func New(o Options) (*Recorder, error) {
 	}
 	if o.Retry == 0 {
 		o.Retry = time.Second
+	}
+	if o.MaxBacklog == 0 {
+		o.MaxBacklog = DefaultMaxBacklog
 	}
 	if o.MaskingPolicyVersion == 0 {
 		o.MaskingPolicyVersion = 1
@@ -197,6 +238,7 @@ func (r *Recorder) Open(info SessionOpen) error {
 	r.opened = true
 	r.openWall = r.o.Now()
 	r.lastSeal = r.openWall
+	r.lastBeat = r.openWall
 	info.SessionID = r.o.SessionID
 	info.ProjectID = r.o.ProjectID
 	info.ResourceType = "web-app"
@@ -289,14 +331,64 @@ func (r *Recorder) FlushEvents() error {
 	return r.sealEventsLocked()
 }
 
-// Tick seals an E chunk when the 10 s window elapsed.
+// Tick records the 30 s heartbeat when due and seals an E chunk when the 10 s window elapsed.
 func (r *Recorder) Tick() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed || !r.opened {
 		return nil
 	}
+	now := r.o.Now()
+	if now.Sub(r.lastBeat) >= HeartbeatInterval {
+		r.lastBeat = now
+		connected := true
+		if r.o.ViewerConnected != nil {
+			connected = r.o.ViewerConnected()
+		}
+		body := heartbeatBody{LastSeq: r.chain.NextSeq() - 1, UptimeMs: now.Sub(r.openWall).Milliseconds(), ViewerConnected: connected}
+		if _, err := r.appendLocked(contract.EventHeartbeat, body, now); err != nil {
+			return err
+		}
+	}
 	return r.sealIfDueLocked()
+}
+
+// MonoUs returns t on the session monotonic clock (microseconds since session_open).
+func (r *Recorder) MonoUs(t time.Time) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return t.Sub(r.openWall).Microseconds()
+}
+
+// PtsMonoUs maps a recording PTS of the current init onto the session monotonic clock (CONTRACTS.md 5.2).
+func (r *Recorder) PtsMonoUs(ptsUs int64) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return contract.MonoFromPts(r.ptsZeroMs, r.openWall.UnixMilli(), ptsUs)
+}
+
+// Loss records a lifecycle loss event.
+func (r *Recorder) Loss(l LossBody) error {
+	_, err := r.Append(contract.EventLoss, l)
+	return err
+}
+
+// backlogFullLocked records a V loss when the upload queue is over its limit, and reports whether the object must be
+// dropped. The first overflow calls OnOverflow.
+func (r *Recorder) backlogFullLocked(size int, fromUs, toUs int64) (bool, error) {
+	if r.queued.Load()+int64(size) <= r.o.MaxBacklog {
+		return false, nil
+	}
+	if _, err := r.appendLocked(contract.EventLoss, LossBody{Stream: "V", FromUs: fromUs, ToUs: toUs, Count: 1, Reason: "upload_backlog"}, r.o.Now()); err != nil {
+		return true, err
+	}
+	if !r.overflowed {
+		r.overflowed = true
+		if r.o.OnOverflow != nil {
+			go r.o.OnOverflow()
+		}
+	}
+	return true, nil
 }
 
 func (r *Recorder) sealEventsLocked() error {
@@ -334,8 +426,32 @@ func (r *Recorder) sealObjectLocked(series contract.Series, kind contract.Checkp
 		SignerKeyID:          r.signer.KeyID,
 		CreatedAtUnixMs:      r.o.Now().UnixMilli(),
 	}
+	r.queued.Add(int64(len(stored)))
 	r.queue <- job{series: series, kind: kind, index: idx, stored: stored, checkpoint: cp.Marshal(), signature: r.signer.sign(cp)}
+	r.persistLocked()
 	return nil
+}
+
+type chainState struct {
+	NextSeq uint64 `json:"nextSeq"`
+	Head    string `json:"head"`
+	ENext   uint32 `json:"eNext"`
+	VNext   uint32 `json:"vNext"`
+}
+
+func (r *Recorder) persistLocked() {
+	if r.o.StatePath == "" {
+		return
+	}
+	head := r.chain.Head()
+	b, _ := json.Marshal(chainState{NextSeq: r.chain.NextSeq(), Head: hex.EncodeToString(head[:]), ENext: r.eNext, VNext: r.vNext})
+	if err := os.MkdirAll(filepath.Dir(r.o.StatePath), 0o700); err != nil {
+		return
+	}
+	tmp := r.o.StatePath + ".tmp"
+	if os.WriteFile(tmp, b, 0o600) == nil {
+		_ = os.Rename(tmp, r.o.StatePath)
+	}
 }
 
 // RecInit turns a REC_INIT into a V init object and its v_init event (CONTRACTS.md 6.6).
@@ -344,6 +460,9 @@ func (r *Recorder) RecInit(meta contract.RecInitMeta, body []byte) error {
 	defer r.mu.Unlock()
 	if !r.opened || r.closed {
 		return ErrClosed
+	}
+	if full, err := r.backlogFullLocked(len(body), r.o.Now().Sub(r.openWall).Microseconds(), r.o.Now().Sub(r.openWall).Microseconds()); full || err != nil {
+		return err
 	}
 	sum := sha256.Sum256(body)
 	idx := r.vNext
@@ -378,9 +497,12 @@ func (r *Recorder) RecSegment(meta contract.RecSegmentMeta, body []byte) error {
 	if meta.SHA256 != sumHex {
 		return fmt.Errorf("recorder: segment %d sha256 mismatch", meta.SegmentIndex)
 	}
+	openMs := r.openWall.UnixMilli()
+	if full, err := r.backlogFullLocked(len(body), contract.MonoFromPts(r.ptsZeroMs, openMs, meta.StartPtsUs), contract.MonoFromPts(r.ptsZeroMs, openMs, meta.EndPtsUs)); full || err != nil {
+		return err
+	}
 	idx := r.vNext
 	r.vNext++
-	openMs := r.openWall.UnixMilli()
 	seq, err := r.appendLocked(contract.EventVSegment, vSegmentBody{
 		ObjectIndex: idx, InitIndex: uint32(r.initIndex), SegmentIndex: meta.SegmentIndex, SHA256: sumHex, Bytes: len(body),
 		StartPtsUs: meta.StartPtsUs, EndPtsUs: meta.EndPtsUs,
@@ -422,6 +544,9 @@ func (r *Recorder) Close(ctx context.Context, reason string) error {
 		r.log.Error().Msg("Web App recorder: uploads still pending at close deadline")
 	}
 	r.erase()
+	if r.o.StatePath != "" {
+		_ = os.Remove(r.o.StatePath)
+	}
 	return err
 }
 
@@ -443,10 +568,33 @@ func (r *Recorder) uploader() {
 		case j.open != nil:
 			r.withRetry("open", func() error { return r.o.Backend.Open(ctx, *j.open) })
 		case j.end != nil:
+			// The end call follows the last checkpoint: resubmit what the backend refused first.
+			for attempt := 0; attempt < 5 && len(r.cpBacklog) > 0; attempt++ {
+				if attempt > 0 {
+					time.Sleep(r.o.Retry)
+				}
+				r.flushCheckpoints(ctx)
+			}
+			if len(r.cpBacklog) > 0 {
+				r.log.Error().Int("checkpoints", len(r.cpBacklog)).Msg("Web App checkpoints still refused at session end")
+			}
 			r.withRetry("end", func() error { return r.o.Backend.End(ctx, *j.end) })
 		default:
 			r.uploadObject(ctx, j)
+			r.queued.Add(-int64(len(j.stored)))
 		}
+	}
+}
+
+// flushCheckpoints resubmits refused checkpoints in order and stops at the first one still refused (E checkpoints
+// must reach the backend in objectIndex order, CONTRACTS.md 6.9).
+func (r *Recorder) flushCheckpoints(ctx context.Context) {
+	for len(r.cpBacklog) > 0 {
+		if err := r.o.Backend.SubmitCheckpoint(ctx, r.cpBacklog[0]); err != nil && statusOf(err) != 404 {
+			r.log.Warn().Err(err).Msg("Web App checkpoint resubmission refused")
+			return
+		}
+		r.cpBacklog = r.cpBacklog[1:]
 	}
 }
 
@@ -477,14 +625,20 @@ func (r *Recorder) uploadObject(ctx context.Context, j job) {
 		return
 	}
 	r.log.Info().Str("series", j.series.Letter()).Uint32("objectIndex", j.index).Int("bytes", len(j.stored)).Msg("Web App object uploaded")
-	r.withRetry("checkpoint", func() error {
-		return r.o.Backend.SubmitCheckpoint(ctx, CheckpointRequest{
-			Checkpoint: base64.StdEncoding.EncodeToString(j.checkpoint),
-			Signature:  base64.StdEncoding.EncodeToString(j.signature),
-			ObjectKey:  presigned.ObjectKey,
-			VersionID:  versionID,
-		})
-	})
+	req := CheckpointRequest{
+		Checkpoint: base64.StdEncoding.EncodeToString(j.checkpoint),
+		Signature:  base64.StdEncoding.EncodeToString(j.signature),
+		ObjectKey:  presigned.ObjectKey,
+		VersionID:  versionID,
+	}
+	r.flushCheckpoints(ctx)
+	if len(r.cpBacklog) > 0 {
+		r.cpBacklog = append(r.cpBacklog, req)
+		return
+	}
+	if !r.withRetry("checkpoint", func() error { return r.o.Backend.SubmitCheckpoint(ctx, req) }) {
+		r.cpBacklog = append(r.cpBacklog, req)
+	}
 }
 
 // withRetry runs fn up to 3 times on network errors and 5xx. A 404 on open, checkpoint or end is tolerated with one
