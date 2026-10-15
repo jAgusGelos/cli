@@ -377,6 +377,16 @@ func (ls *liveSession) serve(ctx context.Context, vl *viewerLink, hello contract
 		}
 	}()
 	ls.log.Info().Str("agentVersion", agent.hello.AgentVersion).Strs("liveCodecs", agent.hello.LiveCodecs).Msg("Web App agent connected")
+	if wa := ls.p.Credentials.WebApp; wa != nil && wa.Credentials.AuthMethod == "form-login" {
+		var recipe contract.FormLoginRecipe
+		b, err := json.Marshal(wa.Credentials.Recipe)
+		if err != nil || json.Unmarshal(b, &recipe) != nil {
+			return fail(contract.ErrCodeProtocol, errors.New("webapp: invalid form-login recipe"))
+		}
+		if err := agent.extCommand(contract.ExtCommand{Kind: "form_login", RequestID: ls.p.SessionID, Recipe: &recipe, Username: wa.Credentials.Username, Password: wa.Credentials.Password}); err != nil {
+			return fail(contract.ErrCodeRunnerUnavailable, err)
+		}
+	}
 	if d := agent.hello.Display; d.Width > 0 && d.Height > 0 {
 		ls.input.setFramebuffer(d.Width, d.Height)
 	}
