@@ -19,8 +19,10 @@ COPY nativehost.py /opt/iwa/nativehost.py
 COPY native-messaging-host.json /etc/chromium/native-messaging-hosts/com.infisical.rbi.json
 RUN mkdir -p /opt/iwa/keys /etc/chromium/native-messaging-hosts \
     && openssl genrsa -out /opt/iwa/keys/ext.pem 2048 2>/dev/null \
-    && chromium --no-sandbox --pack-extension=/opt/iwa/ext --pack-extension-key=/opt/iwa/keys/ext.pem >/dev/null 2>&1 \
     && openssl rsa -in /opt/iwa/keys/ext.pem -pubout -outform DER -out /tmp/ext.pub.der 2>/dev/null \
+    && PUB_B64=$(base64 -w0 /tmp/ext.pub.der) \
+    && sed -i "s#__EXTENSION_KEY__#$PUB_B64#" /opt/iwa/ext/manifest.json \
+    && chromium --no-sandbox --pack-extension=/opt/iwa/ext --pack-extension-key=/opt/iwa/keys/ext.pem >/dev/null 2>&1 \
     && EXT_ID=$(python3 -c 'import hashlib; b=hashlib.sha256(open("/tmp/ext.pub.der","rb").read()).digest()[:16]; print("".join(chr(97+(x>>4)) + chr(97+(x&15)) for x in b))') \
     && sed -i "s/__EXTENSION_ID__/$EXT_ID/g" /opt/iwa/ext/updates.xml \
     && printf '%s\n' "$EXT_ID" >/opt/iwa/ext-id \
