@@ -35,52 +35,6 @@ var (
 	dnsLabelRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 )
 
-type Display struct {
-	Width     int `json:"width"`
-	Height    int `json:"height"`
-	Framerate int `json:"framerate"`
-}
-
-type Recording struct {
-	SegmentSeconds int `json:"segmentSeconds"`
-	BitrateKbps    int `json:"bitrateKbps"`
-	CRF            int `json:"crf"`
-}
-
-type Resources struct {
-	CPUs      float64 `json:"cpus"`
-	MemoryMb  int     `json:"memoryMb"`
-	PidsLimit int     `json:"pidsLimit"`
-}
-
-type Policy struct {
-	Clipboard string `json:"clipboard"`
-	Downloads string `json:"downloads"`
-	Uploads   string `json:"uploads"`
-	Kiosk     bool   `json:"kiosk"`
-}
-
-type Watermark struct {
-	Text string `json:"text"`
-}
-
-// LaunchRequest is the POST /v1/runners body (CONTRACTS 3.1). Optional objects are pointers so defaults apply.
-type LaunchRequest struct {
-	SessionID        string     `json:"sessionId"`
-	Image            string     `json:"image"`
-	RunnerToken      string     `json:"runnerToken"`
-	GatewayAgentAddr string     `json:"gatewayAgentAddr"`
-	EgressProxyAddr  string     `json:"egressProxyAddr"`
-	StartURL         string     `json:"startUrl"`
-	AllowedHosts     []string   `json:"allowedHosts"`
-	CAPem            string     `json:"caPem"`
-	Policy           *Policy    `json:"policy"`
-	Display          *Display   `json:"display"`
-	Recording        *Recording `json:"recording"`
-	Resources        *Resources `json:"resources"`
-	Watermark        *Watermark `json:"watermark"`
-}
-
 // launchSpec is a validated request with defaults applied; every field is safe to place in argv or env.
 type launchSpec struct {
 	SessionID    string
@@ -158,10 +112,10 @@ func validateLaunch(req *LaunchRequest) (*launchSpec, error) {
 	}
 	spec.StartURL = req.StartURL
 
-	if err := validateCAPem(req.CAPem); err != nil {
+	if err := validateCAPem(req.CaPem); err != nil {
 		return nil, err
 	}
-	spec.CAPem = req.CAPem
+	spec.CAPem = req.CaPem
 
 	if spec.Policy, err = validatePolicy(req.Policy); err != nil {
 		return nil, err
@@ -266,9 +220,9 @@ func validateCAPem(caPem string) error {
 	return nil
 }
 
-func validatePolicy(p *Policy) (Policy, error) {
+func validatePolicy(p Policy) (Policy, error) {
 	out := Policy{Clipboard: "off", Downloads: "quarantine", Uploads: "block", Kiosk: true}
-	if p == nil {
+	if p == (Policy{}) {
 		return out, nil
 	}
 	if !oneOf(p.Clipboard, "off", "to_remote", "from_remote", "both") {
@@ -280,12 +234,12 @@ func validatePolicy(p *Policy) (Policy, error) {
 	if !oneOf(p.Uploads, "block", "allow") {
 		return out, invalid("policy.uploads must be block|allow")
 	}
-	return *p, nil
+	return p, nil
 }
 
-func validateDisplay(d *Display) (Display, error) {
+func validateDisplay(d Display) (Display, error) {
 	out := Display{Width: 1280, Height: 720, Framerate: 30}
-	if d == nil {
+	if d == (Display{}) {
 		return out, nil
 	}
 	if d.Width < 320 || d.Width > 1920 || d.Height < 240 || d.Height > 1080 || d.Width%2 != 0 || d.Height%2 != 0 {
@@ -294,12 +248,12 @@ func validateDisplay(d *Display) (Display, error) {
 	if d.Framerate < 5 || d.Framerate > 30 {
 		return out, invalid("display.framerate must be 5..30")
 	}
-	return *d, nil
+	return d, nil
 }
 
-func validateRecording(r *Recording) (Recording, error) {
+func validateRecording(r Recording) (Recording, error) {
 	out := Recording{SegmentSeconds: 10, BitrateKbps: 1500, CRF: 26}
-	if r == nil {
+	if r == (Recording{}) {
 		return out, nil
 	}
 	if r.SegmentSeconds < 2 || r.SegmentSeconds > 60 {
@@ -311,12 +265,12 @@ func validateRecording(r *Recording) (Recording, error) {
 	if r.CRF < 15 || r.CRF > 40 {
 		return out, invalid("recording.crf must be 15..40")
 	}
-	return *r, nil
+	return r, nil
 }
 
-func validateResources(r *Resources) (Resources, error) {
+func validateResources(r Resources) (Resources, error) {
 	out := Resources{CPUs: 1.5, MemoryMb: 1536, PidsLimit: 512}
-	if r == nil {
+	if r == (Resources{}) {
 		return out, nil
 	}
 	if r.CPUs < 0.5 || r.CPUs > 4 {
@@ -328,11 +282,11 @@ func validateResources(r *Resources) (Resources, error) {
 	if r.PidsLimit < 128 || r.PidsLimit > 2048 {
 		return out, invalid("resources.pidsLimit must be 128..2048")
 	}
-	return *r, nil
+	return r, nil
 }
 
-func validateWatermark(w *Watermark, short string) (string, error) {
-	if w == nil || strings.TrimSpace(w.Text) == "" {
+func validateWatermark(w Watermark, short string) (string, error) {
+	if strings.TrimSpace(w.Text) == "" {
 		return "session " + short, nil
 	}
 	if !utf8.ValidString(w.Text) || utf8.RuneCountInString(w.Text) > maxWatermarkRunes || hasControl(w.Text) {

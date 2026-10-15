@@ -17,8 +17,6 @@ import (
 	"time"
 )
 
-const DefaultSocketPath = "/tmp/infisical-webapp/supervisor.sock"
-
 // Error codes returned by the supervisor (CONTRACTS.md 3.1).
 const (
 	CodeInvalidRequest    = "invalid_request"
