@@ -46,6 +46,10 @@ func (h *harness) reconnectAgent(links <-chan authed, ends chan linkEnd) {
 	epochBefore := h.lastEpochLocked()
 	hellosBefore := len(h.hellos)
 	h.mu.Unlock()
+	if old == nil {
+		h.setFault("reconnect", map[string]any{"redialMs": -1, "error": "agent link was already closed"})
+		return
+	}
 	closedAt := time.Now()
 	old.conn.Close()
 	h.logger.Printf("reconnect-test: closed agent link %d (max segment index %d)", old.gen, maxBefore)

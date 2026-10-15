@@ -52,6 +52,7 @@ policy = {
         "ProxyServer": "http://" + os.environ["IWA_PROXY_ADDR"],
         "ProxyBypassList": "<-loopback>",
     },
+    "ExtensionInstallForcelist": ["*;file:///opt/iwa/ext/updates.xml"],
 }
 with open(sys.argv[1], "w") as f:
     json.dump(policy, f, indent=2)
@@ -69,6 +70,7 @@ chromium --kiosk --no-first-run --noerrdialogs --disable-session-crashed-bubble 
   --disable-background-networking --disable-component-update \
   --user-data-dir="$HOME/profile" --password-store=basic --window-position=0,0 \
   --window-size="${WIDTH},${HEIGHT}" \
+  --load-extension=/opt/iwa/ext \
   --proxy-server="http://$IWA_PROXY_ADDR" --proxy-bypass-list="<-loopback>" \
   "$IWA_START_URL" >>"$RUN_DIR/chromium.log" 2>&1 &
 

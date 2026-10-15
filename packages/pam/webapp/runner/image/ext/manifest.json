@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Infisical Web App Runner",
+  "version": "1.0.0",
+  "permissions": ["nativeMessaging", "downloads", "webNavigation"],
+  "host_permissions": ["https://*/*"],
+  "background": {"service_worker": "sw.js"},
+  "content_scripts": [{"matches": ["https://*/*"], "js": ["content.js"], "run_at": "document_end"}]
+}

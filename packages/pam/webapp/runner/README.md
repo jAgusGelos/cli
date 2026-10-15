@@ -18,8 +18,8 @@ go build -o /tmp/iwa/iwa-supervisor ./packages/pam/webapp/supervisor/cmd/iwa-sup
 go build -o /tmp/iwa/iwa-harness ./packages/pam/webapp/runner/harness
 ```
 
-Current image (M2, 2026-10-15 15:05):
-`infisical-webapp-runner@sha256:7654f480060db657c6015ad922b02bd9aeaaf160be2c5313004ab071ccd02b82`
+Current image (M3, 2026-10-15 15:45):
+`infisical-webapp-runner@sha256:25892c050e842a8aee22ba79d6d1a4923742838c4922e658daf323813d923b3e`
 (Chromium `155.0.8059.79-1~deb13u1`, base `debian@sha256:04634311...0a28a`). Every rebuild changes the digest: refresh
 both env lines below.
 
@@ -31,9 +31,9 @@ digest (checked by the harness).
 
 ```bash
 # supervisor (demo only: a release build ships the allowlist of Infisical-published digests instead)
-INFISICAL_WEBAPP_RUNNER_IMAGES=infisical-webapp-runner@sha256:7654f480060db657c6015ad922b02bd9aeaaf160be2c5313004ab071ccd02b82
+INFISICAL_WEBAPP_RUNNER_IMAGES=infisical-webapp-runner@sha256:25892c050e842a8aee22ba79d6d1a4923742838c4922e658daf323813d923b3e
 # gateway: the image ref it sends as `image` in POST /v1/runners
-INFISICAL_WEBAPP_RUNNER_IMAGE=infisical-webapp-runner@sha256:7654f480060db657c6015ad922b02bd9aeaaf160be2c5313004ab071ccd02b82
+INFISICAL_WEBAPP_RUNNER_IMAGE=infisical-webapp-runner@sha256:25892c050e842a8aee22ba79d6d1a4923742838c4922e658daf323813d923b3e
 # both sides, optional override of /tmp/infisical-webapp/supervisor.sock
 INFISICAL_WEBAPP_SUPERVISOR_SOCKET=/tmp/infisical-webapp/supervisor.sock
 ```
@@ -84,6 +84,18 @@ Extra scenarios (each still runs the default checks):
 | `-measure 60` | Wheel motion on the input page while sampling `docker stats` every 2 s; writes `measure.json` |
 | `-stall-test` | SIGSTOP Xvfb for 2 s; expects exactly one `REC_LOSS capture_stall` |
 | `-reconnect-test` | Drops the agent link mid-run; expects a re-dial, continued segment indexes and a new live epoch on `live_start` |
+
+## Extension and download controls (M3)
+
+The image packs `ext/` into `ext.crx` with a build-local RSA key and serves an update manifest at
+`file:///opt/iwa/ext/updates.xml`. The managed policy force-installs it and the Chromium command also loads the same
+immutable extension directory as a delivery fallback. The extension registers `com.infisical.rbi`; the native host
+uses `/tmp/iwa/native.sock` and never writes credentials to logs. The agent forwards `ext_hello`,
+`credential_injected`, `login_result`, `guard_closed`, `nav_blocked`, `pong`, and `download` as `AGENT_EVENT` frames.
+Downloads are forced to `/quarantine`; the agent-side completion path hashes the file before emitting `download`.
+
+The native host accepts only the Chrome little-endian length-prefixed JSON protocol and caps messages at 4 MiB. A
+release image must replace the build-local extension key and record the resulting CRX id in its image provenance.
 
 ## Tests
 
