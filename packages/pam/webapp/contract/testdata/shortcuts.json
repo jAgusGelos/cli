@@ -1,0 +1,237 @@
+[
+  {
+    "name": "ctrl_n_down_up_dropped",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "KeyN",
+        "key": "n",
+        "mods": 2
+      },
+      {
+        "t": "key",
+        "action": "up",
+        "code": "KeyN",
+        "key": "n"
+      }
+    ],
+    "kept": [],
+    "droppedRules": [
+      "Ctrl+N",
+      "Ctrl+N"
+    ]
+  },
+  {
+    "name": "ctrl_shift_n_incognito_dropped",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "KeyN",
+        "key": "N",
+        "mods": 3
+      }
+    ],
+    "kept": [],
+    "droppedRules": [
+      "Ctrl+N"
+    ]
+  },
+  {
+    "name": "ctrl_c_kept",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "KeyC",
+        "key": "c",
+        "mods": 2
+      },
+      {
+        "t": "key",
+        "action": "up",
+        "code": "KeyC",
+        "key": "c",
+        "mods": 2
+      }
+    ],
+    "kept": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "KeyC",
+        "key": "c",
+        "mods": 2
+      },
+      {
+        "t": "key",
+        "action": "up",
+        "code": "KeyC",
+        "key": "c",
+        "mods": 2
+      }
+    ],
+    "droppedRules": []
+  },
+  {
+    "name": "ctrl_shift_c_inspect_dropped",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "KeyC",
+        "key": "C",
+        "mods": 3
+      }
+    ],
+    "kept": [],
+    "droppedRules": [
+      "Ctrl+Shift+C"
+    ]
+  },
+  {
+    "name": "plain_typing_kept",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "KeyH",
+        "key": "h"
+      },
+      {
+        "t": "key",
+        "action": "up",
+        "code": "KeyH",
+        "key": "h"
+      }
+    ],
+    "kept": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "KeyH",
+        "key": "h"
+      },
+      {
+        "t": "key",
+        "action": "up",
+        "code": "KeyH",
+        "key": "h"
+      }
+    ],
+    "droppedRules": []
+  },
+  {
+    "name": "f12_dropped",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "F12",
+        "key": "F12"
+      }
+    ],
+    "kept": [],
+    "droppedRules": [
+      "F12"
+    ]
+  },
+  {
+    "name": "f5_kept",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "F5",
+        "key": "F5"
+      }
+    ],
+    "kept": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "F5",
+        "key": "F5"
+      }
+    ],
+    "droppedRules": []
+  },
+  {
+    "name": "shift_escape_dropped",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "Escape",
+        "key": "Escape",
+        "mods": 1
+      }
+    ],
+    "kept": [],
+    "droppedRules": [
+      "Shift+Escape"
+    ]
+  },
+  {
+    "name": "meta_any_dropped",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "KeyL",
+        "key": "l",
+        "mods": 8
+      }
+    ],
+    "kept": [],
+    "droppedRules": [
+      "Meta+*"
+    ]
+  },
+  {
+    "name": "ctrl_alt_f2_dropped",
+    "events": [
+      {
+        "t": "key",
+        "action": "down",
+        "code": "F2",
+        "key": "F2",
+        "mods": 6
+      }
+    ],
+    "kept": [],
+    "droppedRules": [
+      "Ctrl+Alt+*"
+    ]
+  },
+  {
+    "name": "mouse_back_button_dropped",
+    "events": [
+      {
+        "t": "button",
+        "action": "down",
+        "x": 10,
+        "y": 10,
+        "button": 3
+      },
+      {
+        "t": "button",
+        "action": "down",
+        "x": 10,
+        "y": 10
+      }
+    ],
+    "kept": [
+      {
+        "t": "button",
+        "action": "down",
+        "x": 10,
+        "y": 10
+      }
+    ],
+    "droppedRules": [
+      "Button\u003e2"
+    ]
+  }
+]
