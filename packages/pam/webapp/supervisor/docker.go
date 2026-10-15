@@ -80,7 +80,6 @@ func isNoSuchContainer(err error) bool {
 	return errors.As(err, &de) && strings.Contains(strings.ToLower(de.msg), "no such container")
 }
 
-// ensureNetwork creates iwa-runners if missing and checks an existing one has the contract shape.
 func ensureNetwork(ctx context.Context, d dockerRunner) error {
 	check := func() (bool, error) {
 		out, err := d.Run(ctx, "network", "inspect", "--format",

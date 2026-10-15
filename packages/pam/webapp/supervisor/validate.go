@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -345,12 +346,7 @@ func hasControl(s string) bool {
 }
 
 func oneOf(v string, allowed ...string) bool {
-	for _, a := range allowed {
-		if v == a {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(allowed, v)
 }
 
 // runnerEnv is the IWA_* environment of the runner container (CONTRACTS 3.1 plus IWA_IMAGE_DIGEST).

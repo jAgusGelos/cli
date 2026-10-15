@@ -52,7 +52,7 @@ func TestDockerLaunchDestroy(t *testing.T) {
 		t.Fatalf("launch: %d %v\n%s", code, res, logs.String())
 	}
 	short := shortID(id)
-	img, err := exec.Command("docker", "inspect", "--format", "{{.Image}}", runnerName(short)).Output()
+	img, err := exec.Command("docker", "inspect", "--format", "{{.Image}}", RunnerName(short)).Output()
 	if err != nil || strings.TrimSpace(string(img)) != imageID {
 		t.Fatalf("runner image %q, want %s (%v)", img, imageID, err)
 	}

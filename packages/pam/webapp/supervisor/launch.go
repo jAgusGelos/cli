@@ -28,20 +28,26 @@ const (
 	ipLaunchRetries = 3
 )
 
+const (
+	stateStarting  = "starting"
+	stateRunning   = "running"
+	stateExited    = "exited"
+	stateDestroyed = "destroyed"
+)
+
 var (
 	errAlreadyExists = errors.New("session already exists")
 	errCapacity      = errors.New("capacity exhausted")
 	errIPExhausted   = errors.New("no free runner IP")
 )
 
-func runnerName(short string) string { return "iwa-runner-" + short }
-func pauseName(short string) string  { return "iwa-netns-" + short }
+func RunnerName(short string) string { return "iwa-runner-" + short }
+func PauseName(short string) string  { return "iwa-netns-" + short }
 func helperName(short string) string { return "iwa-nethelper-" + short }
 
 func (s *Server) seccompPath() string    { return filepath.Join(s.cfg.StateDir, "seccomp-chromium.json") }
 func (s *Server) resolvConfPath() string { return filepath.Join(s.cfg.StateDir, "resolv.conf") }
 
-// writeStateFiles writes the empty resolv.conf and the seccomp profile the launch spec references.
 func (s *Server) writeStateFiles() error {
 	if err := os.MkdirAll(s.cfg.StateDir, 0o700); err != nil {
 		return err
@@ -52,7 +58,6 @@ func (s *Server) writeStateFiles() error {
 	return os.WriteFile(s.seccompPath(), seccompProfile, 0o644)
 }
 
-// labeledContainer is one container carrying the session label.
 type labeledContainer struct {
 	name    string
 	session string
@@ -145,7 +150,7 @@ func (s *Server) pickIP(ctx context.Context, sessionID string, skip map[string]b
 }
 
 func pauseArgs(spec *launchSpec, ip, resolvConf, imageID string) []string {
-	return []string{"run", "-d", "--name", pauseName(spec.Short),
+	return []string{"run", "-d", "--name", PauseName(spec.Short),
 		"--label", SessionLabel + "=" + spec.SessionID,
 		"--network", NetworkName, "--ip", ip, "--dns", pauseDNS,
 		"--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
@@ -157,7 +162,7 @@ func pauseArgs(spec *launchSpec, ip, resolvConf, imageID string) []string {
 func helperArgs(spec *launchSpec, imageID string) []string {
 	return []string{"run", "--rm", "--name", helperName(spec.Short),
 		"--label", SessionLabel + "=" + spec.SessionID,
-		"--network", "container:" + pauseName(spec.Short),
+		"--network", "container:" + PauseName(spec.Short),
 		"--user", "0", "--cap-drop", "ALL", "--cap-add", "NET_ADMIN", "--security-opt", "no-new-privileges",
 		"--entrypoint", netnsRulesPath, imageID,
 		HostAddress, strconv.Itoa(spec.AgentPort), strconv.Itoa(spec.ProxyPort)}
@@ -166,9 +171,9 @@ func helperArgs(spec *launchSpec, imageID string) []string {
 // runnerArgs is the fixed runner launch spec (m1-interface.md). Env values travel through the docker client
 // environment; argv only names them.
 func runnerArgs(spec *launchSpec, seccomp, imageID string, envNames []string) []string {
-	args := []string{"run", "-d", "--name", runnerName(spec.Short),
+	args := []string{"run", "-d", "--name", RunnerName(spec.Short),
 		"--label", SessionLabel + "=" + spec.SessionID,
-		"--network", "container:" + pauseName(spec.Short),
+		"--network", "container:" + PauseName(spec.Short),
 		"--read-only",
 		"--tmpfs", "/tmp:rw,nosuid,nodev,exec,size=512m,uid=1000,gid=1000,mode=0700",
 		"--tmpfs", "/home/rbi:rw,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700",
@@ -283,7 +288,7 @@ func (s *Server) launch(ctx context.Context, spec *launchSpec) (res *launchResul
 		if ip, err = s.pickIP(ctx, spec.SessionID, skip); err != nil {
 			return nil, err
 		}
-		s.logger.Printf("launch %s: pause container %s at %s", spec.SessionID, pauseName(spec.Short), ip)
+		s.logger.Printf("launch %s: pause container %s at %s", spec.SessionID, PauseName(spec.Short), ip)
 		_, err = s.docker.Run(ctx, pauseArgs(spec, ip, s.resolvConfPath(), imageID)...)
 		if err == nil {
 			break
@@ -292,7 +297,7 @@ func (s *Server) launch(ctx context.Context, spec *launchSpec) (res *launchResul
 			return nil, err
 		}
 		skip[ip] = true
-		_, _ = s.docker.Run(ctx, "rm", "-f", pauseName(spec.Short))
+		_, _ = s.docker.Run(ctx, "rm", "-f", PauseName(spec.Short))
 	}
 
 	s.logger.Printf("launch %s: netns rules via %s", spec.SessionID, helperName(spec.Short))
@@ -308,7 +313,7 @@ func (s *Server) launch(ctx context.Context, spec *launchSpec) (res *launchResul
 	if err != nil {
 		return nil, err
 	}
-	s.logger.Printf("launch %s: runner container %s", spec.SessionID, runnerName(spec.Short))
+	s.logger.Printf("launch %s: runner container %s", spec.SessionID, RunnerName(spec.Short))
 	if _, err = s.docker.RunEnv(ctx, env, runnerArgs(spec, s.seccompPath(), imageID, envNames(env))...); err != nil {
 		return nil, err
 	}
@@ -320,14 +325,14 @@ func (s *Server) launch(ctx context.Context, spec *launchSpec) (res *launchResul
 	}
 	s.sessions[spec.SessionID] = &session{id: spec.SessionID, short: spec.Short, ip: ip, imageID: imageID}
 	s.mu.Unlock()
-	return &launchResult{SessionID: spec.SessionID, ContainerName: runnerName(spec.Short), IP: ip, State: "starting"}, nil
+	return &launchResult{SessionID: spec.SessionID, ContainerName: RunnerName(spec.Short), IP: ip, State: stateStarting}, nil
 }
 
 // removeSession force-removes the session's containers by name, then sweeps anything else carrying its label.
 func (s *Server) removeSession(ctx context.Context, sessionID string) error {
 	short := shortID(sessionID)
 	var firstErr error
-	for _, name := range []string{runnerName(short), helperName(short), pauseName(short)} {
+	for _, name := range []string{RunnerName(short), helperName(short), PauseName(short)} {
 		if _, err := s.docker.Run(ctx, "rm", "-f", name); err != nil && !isNoSuchContainer(err) && firstErr == nil {
 			firstErr = err
 		}
@@ -358,7 +363,7 @@ type statusResult struct {
 // status reports the runner container state; ok is false for a session this host never knew.
 func (s *Server) status(ctx context.Context, sessionID string) (*statusResult, bool, error) {
 	short := shortID(sessionID)
-	res := &statusResult{SessionID: sessionID, ContainerName: runnerName(short)}
+	res := &statusResult{SessionID: sessionID, ContainerName: RunnerName(short)}
 	s.mu.Lock()
 	known := s.sessions[sessionID]
 	_, pending := s.pending[sessionID]
@@ -370,16 +375,16 @@ func (s *Server) status(ctx context.Context, sessionID string) (*statusResult, b
 
 	out, err := s.docker.Run(ctx, "container", "inspect", "--format",
 		`{{index .Config.Labels "`+SessionLabel+`"}}|{{.State.Status}}|{{.State.StartedAt}}|{{.State.ExitCode}}|{{.State.OOMKilled}}`,
-		runnerName(short))
+		RunnerName(short))
 	if err != nil {
 		if !isNoSuchContainer(err) {
 			return nil, false, err
 		}
 		switch {
 		case pending:
-			res.State = "starting"
+			res.State = stateStarting
 		case destroyed:
-			res.State = "destroyed"
+			res.State = stateDestroyed
 		default:
 			return nil, false, nil
 		}
@@ -394,13 +399,13 @@ func (s *Server) status(ctx context.Context, sessionID string) (*statusResult, b
 	}
 	switch parts[1] {
 	case "created", "restarting":
-		res.State = "starting"
+		res.State = stateStarting
 	case "running", "paused":
-		res.State = "running"
+		res.State = stateRunning
 	case "removing":
-		res.State = "destroyed"
+		res.State = stateDestroyed
 	default:
-		res.State = "exited"
+		res.State = stateExited
 		if code, err := strconv.Atoi(parts[3]); err == nil {
 			res.ExitCode = &code
 		}
@@ -414,7 +419,7 @@ func (s *Server) status(ctx context.Context, sessionID string) (*statusResult, b
 
 func (s *Server) pauseIP(ctx context.Context, short string) string {
 	out, err := s.docker.Run(ctx, "container", "inspect", "--format",
-		`{{with index .NetworkSettings.Networks "`+NetworkName+`"}}{{.IPAddress}}{{end}}`, pauseName(short))
+		`{{with index .NetworkSettings.Networks "`+NetworkName+`"}}{{.IPAddress}}{{end}}`, PauseName(short))
 	if err != nil {
 		return ""
 	}

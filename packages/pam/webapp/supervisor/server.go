@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -27,6 +28,15 @@ const (
 	EnvMaxRunners = "INFISICAL_WEBAPP_MAX_RUNNERS"
 
 	maxBodyBytes = 64 * 1024
+)
+
+const (
+	codeInvalidRequest    = "invalid_request"
+	codeRuntimeError      = "runtime_error"
+	codeNotFound          = "not_found"
+	codeImageNotAllowed   = "image_not_allowed"
+	codeAlreadyExists     = "already_exists"
+	codeCapacityExhausted = "capacity_exhausted"
 )
 
 type Config struct {
@@ -110,7 +120,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/runners/{sessionId}", s.handleStatus)
 	mux.HandleFunc("DELETE /v1/runners/{sessionId}", s.handleDestroy)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusNotFound, "not_found", "no such route")
+		writeError(w, http.StatusNotFound, codeNotFound, "no such route")
 	})
 	return s.logRequests(mux)
 }
@@ -179,12 +189,12 @@ func writeError(w http.ResponseWriter, code int, errCode, msg string) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err := ensureNetwork(r.Context(), s.docker); err != nil {
 		s.logger.Printf("health: %v", err)
-		writeError(w, http.StatusInternalServerError, "runtime_error", "runner network unavailable")
+		writeError(w, http.StatusInternalServerError, codeRuntimeError, "runner network unavailable")
 		return
 	}
 	cs, err := s.listLabeled(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "runtime_error", "docker unavailable")
+		writeError(w, http.StatusInternalServerError, codeRuntimeError, "docker unavailable")
 		return
 	}
 	active := activeSessions(cs)
@@ -200,45 +210,40 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) imageAllowed(image string) bool {
-	for _, a := range s.cfg.Images {
-		if image == a {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s.cfg.Images, image)
 }
 
 func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	var req LaunchRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "body must be a JSON object under 64 KiB")
+		writeError(w, http.StatusBadRequest, codeInvalidRequest, "body must be a JSON object under 64 KiB")
 		return
 	}
 	if dec.Decode(&struct{}{}) != io.EOF {
-		writeError(w, http.StatusBadRequest, "invalid_request", "body must hold one JSON object")
+		writeError(w, http.StatusBadRequest, codeInvalidRequest, "body must hold one JSON object")
 		return
 	}
 	spec, err := validateLaunch(&req)
 	if err != nil {
 		s.logger.Printf("launch rejected: %v", err)
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeError(w, http.StatusBadRequest, codeInvalidRequest, err.Error())
 		return
 	}
 	if !s.imageAllowed(spec.Image) {
 		s.logger.Printf("launch %s rejected: image %q not in allowlist", spec.SessionID, spec.Image)
-		writeError(w, http.StatusForbidden, "image_not_allowed", "image is not in the supervisor allowlist")
+		writeError(w, http.StatusForbidden, codeImageNotAllowed, "image is not in the supervisor allowlist")
 		return
 	}
 	if err := s.reserve(r.Context(), spec); err != nil {
 		switch {
 		case errors.Is(err, errAlreadyExists):
-			writeError(w, http.StatusConflict, "already_exists", "a runner for this session already exists")
+			writeError(w, http.StatusConflict, codeAlreadyExists, "a runner for this session already exists")
 		case errors.Is(err, errCapacity):
-			writeError(w, http.StatusTooManyRequests, "capacity_exhausted", "runner capacity exhausted")
+			writeError(w, http.StatusTooManyRequests, codeCapacityExhausted, "runner capacity exhausted")
 		default:
 			s.logger.Printf("launch %s: admission: %v", spec.SessionID, err)
-			writeError(w, http.StatusInternalServerError, "runtime_error", "docker unavailable")
+			writeError(w, http.StatusInternalServerError, codeRuntimeError, "docker unavailable")
 		}
 		return
 	}
@@ -246,7 +251,7 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	res, err := s.launch(context.WithoutCancel(r.Context()), spec)
 	if err != nil {
 		s.logger.Printf("launch %s failed: %v", spec.SessionID, err)
-		writeError(w, http.StatusInternalServerError, "runtime_error", "runner launch failed")
+		writeError(w, http.StatusInternalServerError, codeRuntimeError, "runner launch failed")
 		return
 	}
 	s.logger.Printf("launch %s: %s at %s", spec.SessionID, res.ContainerName, res.IP)
@@ -256,7 +261,7 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 func sessionParam(w http.ResponseWriter, r *http.Request) (string, bool) {
 	id := r.PathValue("sessionId")
 	if !validSessionID(id) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "sessionId must be a lowercase UUID")
+		writeError(w, http.StatusBadRequest, codeInvalidRequest, "sessionId must be a lowercase UUID")
 		return "", false
 	}
 	return id, true
@@ -270,11 +275,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	res, found, err := s.status(r.Context(), id)
 	if err != nil {
 		s.logger.Printf("status %s: %v", id, err)
-		writeError(w, http.StatusInternalServerError, "runtime_error", "docker unavailable")
+		writeError(w, http.StatusInternalServerError, codeRuntimeError, "docker unavailable")
 		return
 	}
 	if !found {
-		writeError(w, http.StatusNotFound, "not_found", "unknown session")
+		writeError(w, http.StatusNotFound, codeNotFound, "unknown session")
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -293,14 +298,14 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	if err := s.removeSession(context.WithoutCancel(r.Context()), id); err != nil {
 		s.logger.Printf("destroy %s: %v", id, err)
-		writeError(w, http.StatusInternalServerError, "runtime_error", "destroy failed")
+		writeError(w, http.StatusInternalServerError, codeRuntimeError, "destroy failed")
 		return
 	}
 	s.mu.Lock()
 	delete(s.sessions, id)
 	s.destroyed[id] = true
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]string{"state": "destroyed"})
+	writeJSON(w, http.StatusOK, map[string]string{"state": stateDestroyed})
 }
 
 // ShortID exposes the container-name suffix for a session id (first 12 hex digits).
