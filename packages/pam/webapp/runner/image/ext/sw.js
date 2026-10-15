@@ -1,4 +1,5 @@
 let port;
+const pending = new Map();
 const send = (message) => { try { if (port) port.postMessage(message); } catch (_) {} };
 function connect() {
   port = chrome.runtime.connectNative('com.infisical.rbi');
@@ -7,7 +8,11 @@ function connect() {
     if (m.type === 'form_login') {
       chrome.tabs.query({active: true, lastFocusedWindow: true}).then((tabs) => {
         const tab = tabs[0];
-        if (tab) chrome.tabs.sendMessage(tab.id, m).catch(() => send({type: 'login_result', requestId: m.requestId, ok: false, reason: 'selector_not_found', url: tab.url || ''}));
+        if (tab) {
+          pending.set(tab.id, {requestId: m.requestId, check: m.recipe && m.recipe.successCheck, deadline: Date.now() + Number(m.timeoutMs || 15000)});
+          chrome.tabs.sendMessage(tab.id, m).catch(() => send({type: 'login_result', requestId: m.requestId, ok: false, reason: 'selector_not_found', url: tab.url || ''}));
+          setTimeout(() => { const p = pending.get(tab.id); if (p && p.requestId === m.requestId) { pending.delete(tab.id); send({type: 'login_result', requestId: m.requestId, ok: false, reason: 'timeout', url: tab.url || ''}); } }, Number(m.timeoutMs || 15000));
+        }
       });
     }
   });
@@ -31,4 +36,11 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   if (tabs.length > 1) { await chrome.tabs.remove(tab.id); send({type: 'guard_closed', target: 'tab', tabId: tab.id, url: ''}); }
 });
 chrome.webNavigation.onErrorOccurred.addListener((d) => send({type: 'nav_blocked', url: d.url, error: d.error, tabId: d.tabId, frameId: d.frameId}));
+chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+  const p = pending.get(tabId);
+  if (!p || change.status !== 'complete') return;
+  if (p.check && p.check.type === 'url_prefix' && tab.url.startsWith(p.check.value || '')) {
+    pending.delete(tabId); send({type: 'login_result', requestId: p.requestId, ok: true, reason: 'success_check_passed', url: tab.url});
+  } else chrome.tabs.sendMessage(tabId, {type: 'login_check', requestId: p.requestId, successCheck: p.check}).catch(() => {});
+});
 connect();

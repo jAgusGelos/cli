@@ -5,6 +5,11 @@ function setValue(element, value) {
 }
 chrome.runtime.sendMessage({type: 'page', url: location.href, title: document.title, top: window === top});
 chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === 'login_check') {
+    const check = message.successCheck || {};
+    const ok = check.type === 'selector_present' && Boolean(document.querySelector(check.value));
+    return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok, reason: ok ? 'success_check_passed' : 'success_check_failed', url: location.href});
+  }
   if (message.type !== 'form_login') return;
   const recipe = message.recipe || {};
   if (recipe.loginUrl && !location.href.startsWith(recipe.loginUrl)) {
