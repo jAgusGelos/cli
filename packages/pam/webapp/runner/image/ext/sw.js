@@ -10,7 +10,7 @@ function connect() {
         const tab = tabs[0];
         if (tab) {
           pending.set(tab.id, {requestId: m.requestId, check: m.recipe && m.recipe.successCheck, deadline: Date.now() + Number(m.timeoutMs || 15000)});
-          chrome.tabs.sendMessage(tab.id, m).catch(() => send({type: 'login_result', requestId: m.requestId, ok: false, reason: 'selector_not_found', url: tab.url || ''}));
+          chrome.tabs.sendMessage(tab.id, m, {frameId: 0}).catch(() => send({type: 'login_result', requestId: m.requestId, ok: false, reason: 'selector_not_found', url: tab.url || ''}));
           setTimeout(() => { const p = pending.get(tab.id); if (p && p.requestId === m.requestId) { pending.delete(tab.id); send({type: 'login_result', requestId: m.requestId, ok: false, reason: 'timeout', url: tab.url || ''}); } }, Number(m.timeoutMs || 15000));
         }
       });
@@ -47,6 +47,6 @@ chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
   if (!p || change.status !== 'complete') return;
   if (p.check && p.check.type === 'url_prefix' && tab.url.startsWith(p.check.value || '')) {
     pending.delete(tabId); send({type: 'login_result', requestId: p.requestId, ok: true, reason: 'success_check_passed', url: tab.url});
-  } else chrome.tabs.sendMessage(tabId, {type: 'login_check', requestId: p.requestId, successCheck: p.check}).catch(() => {});
+  } else chrome.tabs.sendMessage(tabId, {type: 'login_check', requestId: p.requestId, successCheck: p.check}, {frameId: 0}).catch(() => {});
 });
 connect();

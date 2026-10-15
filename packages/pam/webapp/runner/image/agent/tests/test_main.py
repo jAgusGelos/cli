@@ -3,7 +3,7 @@ import unittest
 
 from _path import AGENT  # noqa: F401
 from iwa_agent.live import annexb_nals, codec_from_annexb, nal_types
-from iwa_agent.main import format_log, load_config, redact
+from iwa_agent.main import agent_event, format_log, load_config, redact
 
 ENV = {
     "IWA_SESSION_ID": "8a0c6a4e-1f7b-4e0e-9a43-5d2a6f0b9c11",
@@ -55,6 +55,22 @@ class ConfigTest(unittest.TestCase):
                 env = dict(ENV, **{key: value})
                 with self.assertRaises(ValueError):
                     load_config(env)
+
+
+class AgentEventTest(unittest.TestCase):
+    def test_focus_keeps_sensitive_and_frame(self):
+        # sw.js adds frameUrl, tabId and frameId; the gateway keys the masking state by tab and frame.
+        msg = {"type": "focus", "sensitive": True, "frameUrl": "https://app.corp.internal/login", "tabId": 7,
+               "frameId": 0}
+        self.assertEqual(agent_event(msg), {"kind": "focus", "sensitive": True,
+                                            "frameUrl": "https://app.corp.internal/login", "tabId": 7, "frameId": 0})
+
+    def test_focus_false_is_forwarded(self):
+        self.assertEqual(agent_event({"type": "focus", "sensitive": False, "tabId": 7, "frameId": 3}),
+                         {"kind": "focus", "sensitive": False, "tabId": 7, "frameId": 3})
+
+    def test_download_outside_quarantine_is_dropped(self):
+        self.assertIsNone(agent_event({"type": "download-complete", "filename": "/etc/passwd", "bytes": 1}))
 
 
 class AnnexBTest(unittest.TestCase):

@@ -4,6 +4,35 @@ function setValue(element, value) {
   element.dispatchEvent(new Event('change', {bubbles: true}));
 }
 chrome.runtime.sendMessage({type: 'page', url: location.href, title: document.title, top: window === top});
+// L3 masking (CONTRACTS.md 4.5, 5.4): report whether keyboard focus is on a secret field, so the gateway records the
+// keys typed into it masked. Runs in every frame; the gateway keeps the state per tab and frame.
+const SECRET_AUTOCOMPLETE = /(^|\s)(current-password|new-password|one-time-code)(\s|$)/;
+function deepActiveElement() {
+  let element = document.activeElement;
+  while (element && element.shadowRoot && element.shadowRoot.activeElement) element = element.shadowRoot.activeElement;
+  return element;
+}
+function isSecretField(element) {
+  if (!element || element.tagName !== 'INPUT') return false;
+  return element.type === 'password' || SECRET_AUTOCOMPLETE.test((element.getAttribute('autocomplete') || '').toLowerCase());
+}
+let secretFocus = false;
+function sendFocus(sensitive) {
+  secretFocus = sensitive;
+  chrome.runtime.sendMessage({type: 'focus', sensitive}).catch(() => {});
+}
+function reportFocus(force) {
+  const sensitive = isSecretField(deepActiveElement());
+  if (sensitive === secretFocus && !force) return;
+  sendFocus(sensitive);
+}
+document.addEventListener('focusin', () => reportFocus(false), true);
+document.addEventListener('focusout', () => setTimeout(() => reportFocus(false), 0), true);
+// Every key typed while sensitive re-asserts the state, and a key re-checks it: this catches focus moved by page script
+// and a "show password" toggle that flips the field type, within the gateway's masking window.
+document.addEventListener('keydown', () => reportFocus(secretFocus), true);
+window.addEventListener('pagehide', () => { if (secretFocus) sendFocus(false); });
+reportFocus(false);
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'login_check') {
     const check = message.successCheck || {};

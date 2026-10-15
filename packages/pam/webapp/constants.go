@@ -24,6 +24,12 @@ const (
 	agentShutdown   = "shutdown"
 )
 
+// AGENT_EVENT kinds (agent -> gateway) the gateway acts on.
+const (
+	agentEventFocus = "focus"
+	agentEventPage  = "page"
+)
+
 // CONTROL_UP kinds (viewer -> gateway).
 const (
 	controlUpEndSession = "end_session"
