@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +66,7 @@ const (
 	testConnModeSnowflake  = "snowflake"
 	testConnModeClickhouse = "clickhouse"
 	testConnModeTCP        = "tcp"
+	testConnModeWebApp     = "web-app"
 )
 
 // testConnectionEnvelope carries the fields common to every connection test; mode selects which client validates
@@ -160,12 +162,107 @@ type sshTestParams struct {
 }
 
 type testConnectionResult struct {
-	Ok bool `json:"ok"`
+	Ok         bool   `json:"ok"`
+	Step       string `json:"step,omitempty"`
+	HTTPStatus int    `json:"httpStatus,omitempty"`
+	Message    string `json:"message,omitempty"`
 }
 
 type testConnectionResponse struct {
 	Result testConnectionResult `json:"result"`
 }
+
+type webAppTestParams struct {
+	URL                   string   `json:"url"`
+	AllowedHosts          []string `json:"allowedHosts"`
+	SSLRejectUnauthorized *bool    `json:"sslRejectUnauthorized"`
+	SSLCertificate        string   `json:"sslCertificate"`
+	AuthMethod            string   `json:"authMethod"`
+	HeaderScheme          string   `json:"headerScheme"`
+	Username              string   `json:"username"`
+	Password              string   `json:"password"`
+	Token                 string   `json:"token"`
+	HeaderName            string   `json:"headerName"`
+	HeaderValue           string   `json:"headerValue"`
+}
+
+func doWebAppConnectionTest(ctx context.Context, target rpcTarget, params webAppTestParams) error {
+	u, err := url.Parse(params.URL)
+	if err != nil || u.Scheme != "http" && u.Scheme != "https" || u.Hostname() == "" {
+		return fmt.Errorf("invalid Web App URL")
+	}
+	host := strings.ToLower(u.Hostname())
+	if !slices.ContainsFunc(params.AllowedHosts, func(allowed string) bool { return strings.EqualFold(strings.TrimSpace(allowed), host) }) {
+		return fmt.Errorf("URL host is not in allowedHosts")
+	}
+	if !strings.EqualFold(target.host, host) {
+		return fmt.Errorf("URL host does not match the signed target")
+	}
+	if port := u.Port(); port != "" && port != strconv.Itoa(target.port) {
+		return fmt.Errorf("URL port does not match the signed target")
+	}
+
+	tlsConfig := &tls.Config{ServerName: host}
+	if params.SSLRejectUnauthorized != nil && !*params.SSLRejectUnauthorized {
+		tlsConfig.InsecureSkipVerify = true // #nosec G402 - explicitly requested by the account
+	} else if params.SSLCertificate != "" {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(params.SSLCertificate)) {
+			return fmt.Errorf("failed to parse SSL certificate")
+		}
+		tlsConfig.RootCAs = pool
+	}
+	dialer := &net.Dialer{}
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(target.host, strconv.Itoa(target.port)))
+		},
+	}
+	client := &http.Client{Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	switch params.AuthMethod {
+	case "none", "":
+	case "header":
+		switch params.HeaderScheme {
+		case "basic":
+			req.SetBasicAuth(params.Username, params.Password)
+		case "bearer":
+			req.Header.Set("Authorization", "Bearer "+params.Token)
+		case "custom":
+			if params.HeaderName == "" || strings.ContainsAny(params.HeaderName, "\r\n") {
+				return fmt.Errorf("invalid custom header")
+			}
+			req.Header.Set(params.HeaderName, params.HeaderValue)
+		default:
+			return fmt.Errorf("unsupported header scheme")
+		}
+	default:
+		return fmt.Errorf("unsupported auth method")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= http.StatusBadRequest {
+		return &webAppHTTPError{status: resp.StatusCode, message: resp.Status}
+	}
+	return nil
+}
+
+type webAppHTTPError struct {
+	status  int
+	message string
+}
+
+func (e *webAppHTTPError) Error() string { return e.message }
 
 // buildTestTLSConfig verifies the server by default; an explicit CA pins it, and rejectUnauthorized=false disables it
 func buildTestTLSConfig(serverName, caCertificate string, rejectUnauthorized *bool) (*tls.Config, error) {
@@ -823,12 +920,28 @@ func handleTestConnection(w http.ResponseWriter, r *http.Request) {
 		}
 	case testConnModeTCP:
 		op = func() error { return doTCPReachabilityTest(ctx, target.host, target.port) }
+	case testConnModeWebApp:
+		var params webAppTestParams
+		if !decode(&params) {
+			return
+		}
+		redactSecrets = append(redactSecrets, params.Password, params.Token, params.HeaderValue)
+		op = func() error { return doWebAppConnectionTest(ctx, target, params) }
 	default:
 		writeRPCError(w, http.StatusBadRequest, fmt.Sprintf("unsupported test-connection mode: %q", env.Mode))
 		return
 	}
 
 	if testErr := runWithContext(ctx, op); testErr != nil {
+		var webErr *webAppHTTPError
+		if errors.As(testErr, &webErr) {
+			writeRPCJSON(w, http.StatusOK, testConnectionResponse{Result: testConnectionResult{Ok: false, Step: "http", HTTPStatus: webErr.status, Message: webErr.message}})
+			return
+		}
+		if env.Mode == testConnModeWebApp {
+			writeRPCJSON(w, http.StatusOK, testConnectionResponse{Result: testConnectionResult{Ok: false, Step: "http", Message: redactProbeSecrets(testErr.Error(), redactSecrets...)}})
+			return
+		}
 		writeRPCErrorWithKind(w, http.StatusBadGateway, redactProbeSecrets(testErr.Error(), redactSecrets...), string(classifyTestConnFailure(testErr)))
 		return
 	}
