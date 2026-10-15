@@ -342,8 +342,9 @@ def run(env):
                         for chunk in iter(lambda: source.read(1024 * 1024), b""):
                             hasher.update(chunk)
                     digest = hasher.hexdigest()
+                    reported_size = int(event.get("bytes") or 0)
                     event.update({"filename": os.path.basename(real), "quarantinePath": real,
-                                  "sha256": digest, "size": int(event.get("bytes") or os.path.getsize(real)),
+                                  "sha256": digest, "size": reported_size if reported_size >= 0 else os.path.getsize(real),
                                   "mime": event.get("mime", "")})
                     kind = "download"
                 except (OSError, ValueError) as exc:

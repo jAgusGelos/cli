@@ -15,7 +15,8 @@ chrome.runtime.onMessage.addListener((message) => {
   if (recipe.loginUrl) {
     try {
       const target = new URL(recipe.loginUrl); const current = new URL(location.href);
-      if (target.origin !== current.origin || !current.pathname.startsWith(target.pathname))
+      const path = target.pathname.endsWith('/') ? target.pathname : target.pathname + '/';
+      if (target.origin !== current.origin || (current.pathname !== target.pathname && !current.pathname.startsWith(path)))
         return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: false, reason: 'success_check_failed', url: location.href});
     } catch (_) {
       return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: false, reason: 'success_check_failed', url: location.href});
