@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -109,8 +110,6 @@ type Service struct {
 	live     map[string]*liveSession
 	agentLn  net.Listener
 	proxyLn  net.Listener
-	closed   bool
-	agentWG  sync.WaitGroup
 	stopOnce sync.Once
 }
 
@@ -119,11 +118,11 @@ func NewService(cfg Config, apiClient *resty.Client) (*Service, error) {
 	cfg.defaults()
 	key, err := recorder.LoadOrCreateRecordingKey(cfg.StateDir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("webapp: recording key: %w", err)
 	}
 	policy, err := egress.NewPolicy(cfg.HostsOverride)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("webapp: INFISICAL_WEBAPP_HOSTS_OVERRIDE: %w", err)
 	}
 	l := log.With().Str("component", "webapp").Logger()
 	s := &Service{
@@ -177,7 +176,7 @@ func (s *Service) run(ctx context.Context) {
 	healthy := false
 	for {
 		if !healthy {
-			hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			hctx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
 			_, err := s.sup.Health(hctx)
 			cancel()
 			healthy = err == nil
@@ -186,14 +185,14 @@ func (s *Service) run(ctx context.Context) {
 			}
 		}
 		if healthy {
-			if err := s.bind(); err == nil {
+			err := s.bind()
+			if err == nil {
 				settle(stateReady)
 				s.log.Info().Str("agentAddr", s.cfg.AgentAddr).Str("proxyAddr", s.cfg.ProxyAddr).Msg("Web App sessions enabled")
 				go func() { <-ctx.Done(); s.Close() }()
 				return
-			} else {
-				s.log.Debug().Err(err).Msg("Web App listener bind failed, retrying")
 			}
+			s.log.Debug().Err(err).Msg("Web App listener bind failed, retrying")
 		}
 		if time.Now().After(deadline) {
 			settle(stateDisabled)
@@ -243,7 +242,6 @@ func (s *Service) Ready(ctx context.Context) bool {
 func (s *Service) Close() {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
-		s.closed = true
 		if s.agentLn != nil {
 			s.agentLn.Close()
 		}
@@ -321,7 +319,7 @@ func (s *Service) handleAgent(c net.Conn) {
 		_ = writeWelcome(c, contract.AgentWelcome{OK: false, Error: reason})
 		c.Close()
 	}
-	_ = c.SetDeadline(time.Now().Add(15 * time.Second))
+	_ = c.SetDeadline(time.Now().Add(agentHelloTimeout))
 	f, err := contract.ReadFrame(c, contract.MaxAgentPayload)
 	if err != nil || f.Type != contract.FrameAgentHello {
 		c.Close()
@@ -341,7 +339,7 @@ func (s *Service) handleAgent(c net.Conn) {
 	}
 	select {
 	case <-p.ipKnown:
-	case <-time.After(10 * time.Second):
+	case <-time.After(runnerIPWait):
 		refuse(welcomeUnauthorized, "runner IP unknown")
 		return
 	}
@@ -350,7 +348,7 @@ func (s *Service) handleAgent(c net.Conn) {
 		refuse(welcomeUnauthorized, "source IP does not match the runner")
 		return
 	}
-	if hello.EncoderMode != "dual" {
+	if hello.EncoderMode != encoderModeDual {
 		refuse(welcomeEncoderModeNotOK, "encoder mode "+hello.EncoderMode)
 		return
 	}

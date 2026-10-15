@@ -44,6 +44,23 @@ type l3Input struct {
 	FrameSeq uint32         `json:"frameSeq"`
 }
 
+// Input event types and actions (CONTRACTS.md 1.8) and the L3 drop kinds the gateway adds.
+const (
+	inputKey    = "key"
+	inputMove   = "move"
+	inputButton = "button"
+	inputWheel  = "wheel"
+	inputIME    = "ime"
+	inputPaste  = "paste"
+
+	actionDown = "down"
+	actionUp   = "up"
+
+	dropMalformed        = "malformed"
+	dropPasteBlocked     = "paste_blocked"
+	dropClipboardBlocked = "clipboard_blocked"
+)
+
 var errMalformed = errors.New("malformed input")
 
 // inputPath validates, filters and prepares one session's viewer input (plan AD-4).
@@ -69,13 +86,13 @@ func (p *inputPath) trackInjected(kept []contract.InputEvent) {
 	defer p.mu.Unlock()
 	for _, ev := range kept {
 		switch {
-		case ev.T == "key" && ev.Action == "down":
+		case ev.T == inputKey && ev.Action == actionDown:
 			p.heldKeys[ev.Code] = ev
-		case ev.T == "key" && ev.Action == "up":
+		case ev.T == inputKey && ev.Action == actionUp:
 			delete(p.heldKeys, ev.Code)
-		case ev.T == "button" && ev.Action == "down":
+		case ev.T == inputButton && ev.Action == actionDown:
 			p.heldButtons[ev.Button] = ev
-		case ev.T == "button" && ev.Action == "up":
+		case ev.T == inputButton && ev.Action == actionUp:
 			delete(p.heldButtons, ev.Button)
 		}
 	}
@@ -87,10 +104,10 @@ func (p *inputPath) releases() []contract.InputEvent {
 	defer p.mu.Unlock()
 	var out []contract.InputEvent
 	for code, ev := range p.heldKeys {
-		out = append(out, contract.InputEvent{T: "key", Action: "up", Code: code, Key: ev.Key})
+		out = append(out, contract.InputEvent{T: inputKey, Action: actionUp, Code: code, Key: ev.Key})
 	}
 	for b, ev := range p.heldButtons {
-		out = append(out, contract.InputEvent{T: "button", Action: "up", Button: b, X: ev.X, Y: ev.Y})
+		out = append(out, contract.InputEvent{T: inputButton, Action: actionUp, Button: b, X: ev.X, Y: ev.Y})
 	}
 	p.heldKeys = map[string]contract.InputEvent{}
 	p.heldButtons = map[int]contract.InputEvent{}
@@ -124,17 +141,17 @@ func (p *inputPath) inBounds(x, y int) bool {
 
 func (p *inputPath) validate(ev contract.InputEvent) bool {
 	switch ev.T {
-	case "key":
-		return (ev.Action == "down" || ev.Action == "up") && ev.Code != "" && len(ev.Code) <= maxKeyFieldLen && len(ev.Key) <= maxKeyFieldLen
-	case "move":
+	case inputKey:
+		return (ev.Action == actionDown || ev.Action == actionUp) && ev.Code != "" && len(ev.Code) <= maxKeyFieldLen && len(ev.Key) <= maxKeyFieldLen
+	case inputMove:
 		return p.inBounds(ev.X, ev.Y)
-	case "button":
-		return (ev.Action == "down" || ev.Action == "up") && ev.Button >= 0 && p.inBounds(ev.X, ev.Y)
-	case "wheel":
+	case inputButton:
+		return (ev.Action == actionDown || ev.Action == actionUp) && ev.Button >= 0 && p.inBounds(ev.X, ev.Y)
+	case inputWheel:
 		return p.inBounds(ev.X, ev.Y) && !math.IsNaN(ev.DX) && !math.IsNaN(ev.DY) && math.Abs(ev.DX) <= maxWheelDelta && math.Abs(ev.DY) <= maxWheelDelta
-	case "ime":
+	case inputIME:
 		return ev.Text != "" && len(ev.Text) <= maxIMETextBytes
-	case "paste":
+	case inputPaste:
 		return ev.ID != "" && ev.Total > 0 && ev.Part >= 0 && ev.Part < ev.Total
 	}
 	return false
@@ -157,25 +174,17 @@ func (p *inputPath) process(payload []byte, frameSeq uint32, arrival time.Time) 
 		}
 	}
 	if !valid {
-		cutoff := arrival.Add(-malformedWindow)
-		kept := p.malformed[:0]
-		for _, t := range p.malformed {
-			if t.After(cutoff) {
-				kept = append(kept, t)
-			}
-		}
-		p.malformed = append(kept, arrival)
-		rec = &l3Input{Events: []l3Event{}, Dropped: []droppedEntry{{T: "malformed", Rule: "malformed"}}, FrameSeq: frameSeq}
-		return nil, rec, len(p.malformed) >= malformedLimit, errMalformed
+		rec = &l3Input{Events: []l3Event{}, Dropped: []droppedEntry{{T: dropMalformed, Rule: dropMalformed}}, FrameSeq: frameSeq}
+		return nil, rec, p.noteMalformedLocked(arrival) >= malformedLimit, errMalformed
 	}
 
 	var dropped []droppedEntry
 	var candidates []contract.InputEvent
 	for _, ev := range batch.Events {
-		if ev.T == "paste" {
+		if ev.T == inputPaste {
 			// Clipboard to the remote is off by default (CONTRACTS.md 8.3); paste reassembly is not implemented yet.
 			n := len(ev.Text)
-			dropped = append(dropped, droppedEntry{T: "paste_blocked", Bytes: &n})
+			dropped = append(dropped, droppedEntry{T: dropPasteBlocked, Bytes: &n})
 			continue
 		}
 		candidates = append(candidates, ev)
@@ -185,23 +194,7 @@ func (p *inputPath) process(payload []byte, frameSeq uint32, arrival time.Time) 
 		dropped = append(dropped, droppedEntry{T: d.T, Action: d.Action, Code: d.Code, Mods: d.Mods, Button: d.Button, Rule: d.Rule})
 	}
 
-	// L3 keeps every non-move event; moves are coalesced to at most one per 100 ms, the last move of a frame wins.
-	recorded := make([]contract.InputEvent, 0, len(kept))
-	lastMove := -1
-	for i, ev := range kept {
-		if ev.T == "move" {
-			lastMove = i
-		}
-	}
-	for i, ev := range kept {
-		if ev.T == "move" {
-			if i != lastMove || arrival.Sub(p.lastMoveRec) < moveRecordPeriod {
-				continue
-			}
-			p.lastMoveRec = arrival
-		}
-		recorded = append(recorded, ev)
-	}
+	recorded := p.coalesceMovesLocked(kept, arrival)
 	if dropped == nil {
 		dropped = []droppedEntry{}
 	}
@@ -211,7 +204,42 @@ func (p *inputPath) process(payload []byte, frameSeq uint32, arrival time.Time) 
 	return kept, rec, false, nil
 }
 
+// noteMalformedLocked adds a malformed frame at arrival and returns how many fell within malformedWindow.
+func (p *inputPath) noteMalformedLocked(arrival time.Time) int {
+	cutoff := arrival.Add(-malformedWindow)
+	kept := p.malformed[:0]
+	for _, t := range p.malformed {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	p.malformed = append(kept, arrival)
+	return len(p.malformed)
+}
+
+// coalesceMovesLocked keeps every non-move event for L3; moves are coalesced to at most one per moveRecordPeriod, the
+// last move of a frame wins.
+func (p *inputPath) coalesceMovesLocked(kept []contract.InputEvent, arrival time.Time) []contract.InputEvent {
+	recorded := make([]contract.InputEvent, 0, len(kept))
+	lastMove := -1
+	for i, ev := range kept {
+		if ev.T == inputMove {
+			lastMove = i
+		}
+	}
+	for i, ev := range kept {
+		if ev.T == inputMove {
+			if i != lastMove || arrival.Sub(p.lastMoveRec) < moveRecordPeriod {
+				continue
+			}
+			p.lastMoveRec = arrival
+		}
+		recorded = append(recorded, ev)
+	}
+	return recorded
+}
+
 // clipboardBlocked is the L3 body for a dropped CLIPBOARD_UP frame.
 func clipboardBlocked(n int, frameSeq uint32) *l3Input {
-	return &l3Input{Events: []l3Event{}, Dropped: []droppedEntry{{T: "clipboard_blocked", Bytes: &n}}, FrameSeq: frameSeq}
+	return &l3Input{Events: []l3Event{}, Dropped: []droppedEntry{{T: dropClipboardBlocked, Bytes: &n}}, FrameSeq: frameSeq}
 }

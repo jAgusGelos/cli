@@ -43,7 +43,7 @@ type settings struct {
 
 func resolveSettings(in *api.PAMWebAppSettings) settings {
 	s := settings{
-		liveCodecs: []string{"vp9", "h264"}, onRecorderOverflow: "continue_with_loss",
+		liveCodecs: []string{codecVP9, codecH264}, onRecorderOverflow: overflowContinueWithLoss,
 		clipboard: "off", downloads: "quarantine", uploads: "block", idleTimeoutMinutes: 15, bodyCapBytes: 65536,
 	}
 	if in == nil {
@@ -136,7 +136,6 @@ type liveSession struct {
 	inflightB     int
 	dropping      bool
 	lastKeyReq    time.Time
-	keyReqDrops   int
 	degraded      bool
 	droppedFrames int
 	lastDrop      time.Time
@@ -201,13 +200,13 @@ func (ls *liveSession) touch() {
 }
 
 func (ls *liveSession) record(t contract.EventType, body any) {
-	if _, err := ls.rec.Append(t, body); err != nil && !errors.Is(err, recorder.ErrClosed) {
+	if _, err := ls.rec.Append(t, body); recorderFailed(err) {
 		ls.log.Error().Err(err).Str("event", t.String()).Msg("Web App recording append failed")
 	}
 }
 
 func (ls *liveSession) recordAt(t contract.EventType, body any, at time.Time) {
-	if _, err := ls.rec.AppendAt(t, body, at); err != nil && !errors.Is(err, recorder.ErrClosed) {
+	if _, err := ls.rec.AppendAt(t, body, at); recorderFailed(err) {
 		ls.log.Error().Err(err).Str("event", t.String()).Msg("Web App recording append failed")
 	}
 }
@@ -225,41 +224,28 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 
 	l := s.log.With().Str("sessionId", p.SessionID).Logger()
 	vl := newViewerLink(conn)
-	defer vl.close(2 * time.Second)
-	fail := func(code string, err error) error {
-		vl.controlError(code, code, true)
-		l.Error().Err(err).Str("code", code).Msg("Web App session failed")
-		return err
-	}
+	defer vl.close(viewerFlushWait)
+	fail := func(code string, err error) error { return failSession(vl, l, code, err) }
 
-	readyCtx, cancelReady := context.WithTimeout(ctx, s.cfg.HealthTimeout+5*time.Second)
+	readyCtx, cancelReady := context.WithTimeout(ctx, s.cfg.HealthTimeout+readyGraceExtra)
 	ready := s.Ready(readyCtx)
 	cancelReady()
 	if !ready {
 		return fail(contract.ErrCodeRunnerUnavailable, errors.New("webapp: Web App sessions are disabled (supervisor unavailable)"))
 	}
-	if p.Credentials == nil || p.Credentials.WebApp == nil {
-		return fail(contract.ErrCodeInternal, errors.New("webapp: credentials carry no webApp object"))
-	}
-	if p.Recording == nil || len(p.Recording.SessionKey) != 32 || p.Recording.UploadToken == "" {
-		return fail(contract.ErrCodeInternal, errors.New("webapp: recording secrets missing"))
+	if err := checkParams(p); err != nil {
+		return fail(contract.ErrCodeInternal, err)
 	}
 	wa := p.Credentials.WebApp
 	cfg := resolveSettings(wa.Settings)
-	allowed := make([]string, 0, len(wa.ConnectionDetails.AllowedHosts))
-	for _, h := range wa.ConnectionDetails.AllowedHosts {
-		allowed = append(allowed, strings.ToLower(strings.TrimSpace(h)))
-	}
+	allowed := normalizeHosts(wa.ConnectionDetails.AllowedHosts)
 
 	hello, err := readHello(conn, s.cfg.HelloTimeout)
 	if err != nil {
-		if errors.Is(err, contract.ErrFrameTooLarge) {
-			return fail(contract.ErrCodeFrameTooLarge, err)
-		}
-		return fail(contract.ErrCodeProtocol, err)
+		return fail(frameErrCode(err), err)
 	}
 
-	ls := &liveSession{svc: s, p: p, cfg: cfg, log: l, endCh: make(chan struct{}), ready: make(chan struct{}), endReason: "error",
+	ls := &liveSession{svc: s, p: p, cfg: cfg, log: l, endCh: make(chan struct{}), ready: make(chan struct{}), endReason: endError,
 		input: newInputPath(defaultDisplay.Width, defaultDisplay.Height)}
 	s.mu.Lock()
 	if s.live[p.SessionID] != nil {
@@ -291,32 +277,13 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 		}
 	}()
 
-	agentAddr, proxyAddr := s.addrs()
-	launch := supervisor.LaunchRequest{
-		SessionID: p.SessionID, Image: s.cfg.RunnerImage, RunnerToken: token,
-		GatewayAgentAddr: agentAddr, EgressProxyAddr: proxyAddr,
-		StartURL: wa.ConnectionDetails.URL, AllowedHosts: allowed,
-		// Tunnel-only egress: Chromium sees the app's own certificate, so it trusts the app CA (certificate only).
-		CaPem:     wa.ConnectionDetails.SSLCertificate,
-		Policy:    supervisor.Policy{Clipboard: cfg.clipboard, Downloads: cfg.downloads, Uploads: cfg.uploads, Kiosk: true},
-		Display:   defaultDisplay,
-		Recording: defaultRecording,
-		Resources: defaultResources,
-		Watermark: supervisor.Watermark{Text: fmt.Sprintf("%s %s", shortID(p.SessionID), time.Now().UTC().Format("2006-01-02T15:04Z"))},
-	}
-	lctx, cancelLaunch := context.WithTimeout(ctx, 90*time.Second)
-	runner, err := s.sup.Launch(lctx, launch)
-	cancelLaunch()
+	runner, err := s.launchRunner(ctx, p, cfg, allowed, token)
 	if err != nil {
-		code := contract.ErrCodeRunnerUnavailable
-		if supervisor.IsCode(err, supervisor.CodeCapacityExhausted) {
-			code = contract.ErrCodeCapacity
-		}
-		return fail(code, fmt.Errorf("webapp: launch runner: %w", err))
+		return fail(launchErrCode(err), fmt.Errorf("webapp: launch runner: %w", err))
 	}
 	l.Info().Str("container", runner.ContainerName).Str("ip", runner.IP).Msg("Web App runner launched")
 	defer func() {
-		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		dctx, cancel := context.WithTimeout(context.Background(), destroyTimeout)
 		defer cancel()
 		if err := s.sup.Destroy(dctx, p.SessionID); err != nil {
 			l.Error().Err(err).Msg("Web App runner destroy failed")
@@ -328,15 +295,7 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 	}
 	pending.setIP(runnerIP)
 
-	rec, err := recorder.New(recorder.Options{
-		SessionID: p.SessionID, ProjectID: p.Recording.ProjectId, SessionKey: p.Recording.SessionKey,
-		RecordingKey: s.recKey, ExpiresAt: p.ExpiresAt,
-		Backend:         s.newBackend(p.SessionID, p.Recording.UploadToken),
-		Log:             l,
-		ViewerConnected: func() bool { return ls.currentViewer() != nil },
-		OnOverflow:      func() { ls.recordingLoss(0) },
-		StatePath:       filepath.Join(s.cfg.StateDir, "webapp-sessions", p.SessionID+".json"),
-	})
+	rec, err := s.newRecorder(ls)
 	if err != nil {
 		return fail(contract.ErrCodeInternal, err)
 	}
@@ -348,7 +307,7 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 		return fail(contract.ErrCodeInternal, err)
 	}
 	defer func() {
-		cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		cctx, cancel := context.WithTimeout(context.Background(), recorderCloseTimeout)
 		defer cancel()
 		if err := rec.Close(cctx, ls.reason()); err != nil {
 			l.Error().Err(err).Msg("Web App recorder close failed")
@@ -363,14 +322,20 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 	defer close(tickDone)
 	go ls.ticker(tickDone)
 
-	// Wait for the runner agent.
+	return ls.serve(ctx, vl, hello, pending)
+}
+
+// serve waits for the runner agent, starts the live stream and the first viewer link, and returns when the session
+// ends.
+func (ls *liveSession) serve(ctx context.Context, vl *viewerLink, hello contract.ViewerHello, pending *pendingAgent) error {
+	fail := func(code string, err error) error { return failSession(vl, ls.log, code, err) }
 	var agent *agentLink
 	select {
 	case agent = <-pending.links:
-	case <-time.After(s.cfg.AgentWaitTimeout):
+	case <-time.After(ls.svc.cfg.AgentWaitTimeout):
 		return fail(contract.ErrCodeRunnerUnavailable, errAgentTimeout)
 	case <-ctx.Done():
-		ls.end(endReasonForCancel(p.ExpiresAt))
+		ls.end(endReasonForCancel(ls.p.ExpiresAt))
 		return ctx.Err()
 	}
 	ls.mu.Lock()
@@ -381,38 +346,110 @@ func (s *Service) HandleSession(ctx context.Context, conn net.Conn, p SessionPar
 			a.conn.Close()
 		}
 	}()
-	l.Info().Str("agentVersion", agent.hello.AgentVersion).Strs("liveCodecs", agent.hello.LiveCodecs).Msg("Web App agent connected")
+	ls.log.Info().Str("agentVersion", agent.hello.AgentVersion).Strs("liveCodecs", agent.hello.LiveCodecs).Msg("Web App agent connected")
 	if d := agent.hello.Display; d.Width > 0 && d.Height > 0 {
 		ls.input.setFramebuffer(d.Width, d.Height)
 	}
 
-	ls.candidates = intersect(cfg.liveCodecs, agent.hello.LiveCodecs)
+	ls.candidates = intersect(ls.cfg.liveCodecs, agent.hello.LiveCodecs)
 	codec, ok := contract.ChooseLiveCodec(hello, ls.candidates)
 	if !ok {
 		return fail(contract.ErrCodeNoDecoder, errors.New("webapp: no live codec in common with the viewer"))
 	}
 	if err := ls.startLive(codec); err != nil {
-		ls.end("runner_exit")
+		ls.end(endRunnerExit)
 		return fail(contract.ErrCodeRunnerUnavailable, err)
 	}
 	go ls.readAgent(agent)
 	go ls.watchAgentLinks(pending)
 
-	ls.attachViewer(vl, p.OnActivity, true)
+	ls.attachViewer(vl, ls.p.OnActivity, true)
 	close(ls.ready)
 
 	select {
 	case <-ls.endCh:
 	case <-ctx.Done():
-		ls.end(endReasonForCancel(p.ExpiresAt))
+		ls.end(endReasonForCancel(ls.p.ExpiresAt))
 	}
 	reason := ls.reason()
 	if v := ls.currentViewer(); v != nil {
 		v.control(contract.ControlDown{Kind: contract.ControlSessionEnding, Reason: reason})
-		v.close(2 * time.Second)
+		v.close(viewerFlushWait)
 	}
-	ls.agentControl(contract.AgentControl{Kind: "shutdown", Reason: reason})
+	ls.agentControl(contract.AgentControl{Kind: agentShutdown, Reason: reason})
 	return nil
+}
+
+func failSession(vl *viewerLink, l zerolog.Logger, code string, err error) error {
+	vl.fatalError(code)
+	l.Error().Err(err).Str("code", code).Msg("Web App session failed")
+	return err
+}
+
+func checkParams(p SessionParams) error {
+	if p.Credentials == nil || p.Credentials.WebApp == nil {
+		return errors.New("webapp: credentials carry no webApp object")
+	}
+	if p.Recording == nil || len(p.Recording.SessionKey) != sessionKeyBytes || p.Recording.UploadToken == "" {
+		return errors.New("webapp: recording secrets missing")
+	}
+	return nil
+}
+
+func normalizeHosts(hosts []string) []string {
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		out = append(out, strings.ToLower(strings.TrimSpace(h)))
+	}
+	return out
+}
+
+// frameErrCode maps a frame read error to the CONTROL error code sent to the viewer.
+func frameErrCode(err error) string {
+	if errors.Is(err, contract.ErrFrameTooLarge) {
+		return contract.ErrCodeFrameTooLarge
+	}
+	return contract.ErrCodeProtocol
+}
+
+func launchErrCode(err error) string {
+	if supervisor.IsCode(err, supervisor.CodeCapacityExhausted) {
+		return contract.ErrCodeCapacity
+	}
+	return contract.ErrCodeRunnerUnavailable
+}
+
+func (s *Service) launchRunner(ctx context.Context, p SessionParams, cfg settings, allowed []string, token string) (*supervisor.LaunchResponse, error) {
+	wa := p.Credentials.WebApp
+	agentAddr, proxyAddr := s.addrs()
+	launch := supervisor.LaunchRequest{
+		SessionID: p.SessionID, Image: s.cfg.RunnerImage, RunnerToken: token,
+		GatewayAgentAddr: agentAddr, EgressProxyAddr: proxyAddr,
+		StartURL: wa.ConnectionDetails.URL, AllowedHosts: allowed,
+		// Tunnel-only egress: Chromium sees the app's own certificate, so it trusts the app CA (certificate only).
+		CaPem:     wa.ConnectionDetails.SSLCertificate,
+		Policy:    supervisor.Policy{Clipboard: cfg.clipboard, Downloads: cfg.downloads, Uploads: cfg.uploads, Kiosk: true},
+		Display:   defaultDisplay,
+		Recording: defaultRecording,
+		Resources: defaultResources,
+		Watermark: supervisor.Watermark{Text: fmt.Sprintf("%s %s", shortID(p.SessionID), time.Now().UTC().Format("2006-01-02T15:04Z"))},
+	}
+	lctx, cancel := context.WithTimeout(ctx, launchTimeout)
+	defer cancel()
+	return s.sup.Launch(lctx, launch)
+}
+
+func (s *Service) newRecorder(ls *liveSession) (*recorder.Recorder, error) {
+	p := ls.p
+	return recorder.New(recorder.Options{
+		SessionID: p.SessionID, ProjectID: p.Recording.ProjectId, SessionKey: p.Recording.SessionKey,
+		RecordingKey: s.recKey, ExpiresAt: p.ExpiresAt,
+		Backend:         s.newBackend(p.SessionID, p.Recording.UploadToken),
+		Log:             ls.log,
+		ViewerConnected: func() bool { return ls.currentViewer() != nil },
+		OnOverflow:      func() { ls.recordingLoss(0) },
+		StatePath:       filepath.Join(s.cfg.StateDir, "webapp-sessions", p.SessionID+".json"),
+	})
 }
 
 func readHello(conn net.Conn, timeout time.Duration) (contract.ViewerHello, error) {
@@ -427,30 +464,6 @@ func readHello(conn net.Conn, timeout time.Duration) (contract.ViewerHello, erro
 		return hello, errors.New("webapp: first viewer frame is not a valid HELLO")
 	}
 	return hello, nil
-}
-
-// startLive asks the agent for the live stream and records the codec choice when it changes.
-func (ls *liveSession) startLive(codec string) error {
-	a := ls.currentAgent()
-	if a == nil {
-		return errors.New("webapp: no agent link")
-	}
-	if err := a.control(contract.AgentControl{Kind: "live_start", Codec: codec, BitrateKbps: 2500}); err != nil {
-		return err
-	}
-	ls.mu.Lock()
-	changed := ls.codec != codec
-	ls.codec = codec
-	ls.mu.Unlock()
-	if changed {
-		codecString := contract.CodecStringH264Live
-		if codec == "vp9" {
-			codecString = contract.CodecStringVP9Live
-		}
-		ls.record(contract.EventLiveCodec, map[string]any{"codec": codec, "codecString": codecString, "encoderMode": "dual", "candidates": ls.candidates})
-		ls.log.Info().Str("codec", codec).Msg("Web App live codec chosen")
-	}
-	return nil
 }
 
 // attachViewer makes vl the session's viewer link: session_ready and time_left, the last VIDEO_CONFIG, a fresh
@@ -525,31 +538,31 @@ func (ls *liveSession) viewerGone(vl *viewerLink) {
 // attach serves a reattaching viewer on a new tunnel connection (CONTRACTS.md 1.11).
 func (ls *liveSession) attach(ctx context.Context, conn net.Conn, p SessionParams) error {
 	vl := newViewerLink(conn)
-	defer vl.close(2 * time.Second)
+	defer vl.close(viewerFlushWait)
 	select {
 	case <-ls.ready:
 	case <-ls.endCh:
 		vl.controlError(contract.ErrCodeInternal, "session ended", true)
 		return errors.New("webapp: session ended before the reattach")
 	case <-time.After(attachReadyTimeout):
-		vl.controlError(contract.ErrCodeSessionInUse, contract.ErrCodeSessionInUse, true)
+		vl.fatalError(contract.ErrCodeSessionInUse)
 		return errors.New("webapp: session not ready for a reattach")
 	}
 	hello, err := readHello(conn, ls.svc.cfg.HelloTimeout)
 	if err != nil {
-		vl.controlError(contract.ErrCodeProtocol, contract.ErrCodeProtocol, true)
+		vl.fatalError(contract.ErrCodeProtocol)
 		return err
 	}
 	ls.mu.Lock()
 	busy := ls.viewer != nil
 	ls.mu.Unlock()
 	if busy {
-		vl.controlError(contract.ErrCodeSessionInUse, contract.ErrCodeSessionInUse, true)
+		vl.fatalError(contract.ErrCodeSessionInUse)
 		return errors.New("webapp: a viewer is already attached")
 	}
 	codec, ok := contract.ChooseLiveCodec(hello, ls.candidates)
 	if !ok {
-		vl.controlError(contract.ErrCodeNoDecoder, contract.ErrCodeNoDecoder, true)
+		vl.fatalError(contract.ErrCodeNoDecoder)
 		return errors.New("webapp: no live codec in common with the reattaching viewer")
 	}
 	ls.mu.Lock()
@@ -560,7 +573,7 @@ func (ls *liveSession) attach(ctx context.Context, conn net.Conn, p SessionParam
 	ls.mu.Unlock()
 	if !sameCodec {
 		if err := ls.startLive(codec); err != nil {
-			vl.controlError(contract.ErrCodeRunnerUnavailable, contract.ErrCodeRunnerUnavailable, true)
+			vl.fatalError(contract.ErrCodeRunnerUnavailable)
 			return err
 		}
 	}
@@ -622,9 +635,9 @@ func (ls *liveSession) reportDegraded(active bool, dropped int) {
 
 // recordingLoss tells the viewer about recorder loss and applies the overflow policy (CONTRACTS.md 4.3).
 func (ls *liveSession) recordingLoss(lostMs int64) {
-	ls.viewerControl(contract.ControlDown{Kind: contract.ControlRecordingState, State: "loss", LostMs: &lostMs})
-	if ls.cfg.onRecorderOverflow == "terminate" {
-		ls.end("recording_failed")
+	ls.viewerControl(contract.ControlDown{Kind: contract.ControlRecordingState, State: recordingStateLoss, LostMs: &lostMs})
+	if ls.cfg.onRecorderOverflow == overflowTerminate {
+		ls.end(endRecordingFailed)
 	}
 }
 
@@ -635,7 +648,9 @@ func (ls *liveSession) releaseHeld() {
 		return
 	}
 	if a := ls.currentAgent(); a != nil {
-		_ = a.sendJSON(contract.FrameInputInject, contract.InputBatch{Events: rel})
+		if err := a.sendJSON(contract.FrameInputInject, contract.InputBatch{Events: rel}); err != nil {
+			ls.log.Debug().Err(err).Msg("Web App: release injection failed")
+		}
 	}
 	ls.record(contract.EventL3Input, &l3Input{Events: toL3(rel, true), Dropped: []droppedEntry{}})
 }
@@ -649,16 +664,16 @@ func shortID(id string) string {
 
 func endReasonForCancel(expiresAt time.Time) string {
 	if !time.Now().Before(expiresAt) {
-		return "expired"
+		return endExpired
 	}
-	return "admin_terminated"
+	return endAdminTerminated
 }
 
 func viewerGoneReason(expiresAt time.Time) string {
 	if !time.Now().Before(expiresAt) {
-		return "expired"
+		return endExpired
 	}
-	return "viewer_lost"
+	return endViewerLost
 }
 
 func (ls *liveSession) readViewer(vl *viewerLink) {
@@ -667,12 +682,8 @@ func (ls *liveSession) readViewer(vl *viewerLink) {
 		f, err := contract.ReadFrame(vl.conn, contract.MaxUpstreamPayload)
 		if err != nil {
 			if errors.Is(err, contract.ErrFrameTooLarge) || errors.Is(err, contract.ErrBadVersion) {
-				code := contract.ErrCodeFrameTooLarge
-				if errors.Is(err, contract.ErrBadVersion) {
-					code = contract.ErrCodeProtocol
-				}
-				vl.controlError(code, code, true)
-				vl.close(time.Second)
+				vl.fatalError(frameErrCode(err))
+				vl.close(viewerErrorFlushWait)
 			}
 			return
 		}
@@ -692,27 +703,35 @@ func (ls *liveSession) readViewer(vl *viewerLink) {
 		case contract.FrameKeyframeRequest:
 			ls.requestKeyframe(false)
 		case contract.FrameControlUp:
-			var cu contract.ControlUp
-			if json.Unmarshal(f.Payload, &cu) != nil {
-				continue
-			}
-			switch cu.Kind {
-			case "end_session":
-				ls.end("user_end")
+			if ls.handleControlUp(f.Payload) {
 				// Keep the link open so the owner can send session_ending on it, then close it.
 				<-vl.dead
 				return
-			case "visibility":
-				kind := "live_resume"
-				if cu.Hidden != nil && *cu.Hidden {
-					kind = "live_pause"
-				}
-				ls.agentControl(contract.AgentControl{Kind: kind})
 			}
 		case contract.FrameClipboardUp:
 			ls.recordAt(contract.EventL3Input, clipboardBlocked(len(f.Payload), f.Seq), arrival)
 		}
 	}
+}
+
+// handleControlUp applies one CONTROL_UP and reports whether the viewer ended the session.
+func (ls *liveSession) handleControlUp(payload []byte) bool {
+	var cu contract.ControlUp
+	if json.Unmarshal(payload, &cu) != nil {
+		return false
+	}
+	switch cu.Kind {
+	case controlUpEndSession:
+		ls.end(endUserEnd)
+		return true
+	case controlUpVisibility:
+		kind := agentLiveResume
+		if cu.Hidden != nil && *cu.Hidden {
+			kind = agentLivePause
+		}
+		ls.agentControl(contract.AgentControl{Kind: kind})
+	}
+	return false
 }
 
 func (ls *liveSession) handleInput(vl *viewerLink, f *contract.Frame, arrival time.Time) {
@@ -724,7 +743,7 @@ func (ls *liveSession) handleInput(vl *viewerLink, f *contract.Frame, arrival ti
 		vl.controlError(contract.ErrCodeProtocol, "malformed INPUT frame", false)
 		if tooMany {
 			ls.log.Warn().Msg("Web App: too many malformed input frames, closing the viewer link")
-			vl.close(time.Second)
+			vl.close(viewerErrorFlushWait)
 		}
 		return
 	}
@@ -740,206 +759,4 @@ func (ls *liveSession) handleInput(vl *viewerLink, f *contract.Frame, arrival ti
 		return
 	}
 	ls.input.trackInjected(kept)
-}
-
-// ack releases live-window entries up to ackSeq (inclusive, wrap-aware).
-func (ls *liveSession) ack(ackSeq uint32) {
-	ls.winMu.Lock()
-	defer ls.winMu.Unlock()
-	i := 0
-	for ; i < len(ls.inflight); i++ {
-		if int32(ls.inflight[i].seq-ackSeq) > 0 {
-			break
-		}
-		ls.inflightB -= ls.inflight[i].size
-	}
-	ls.inflight = ls.inflight[i:]
-}
-
-// requestKeyframe asks the live encoder for a keyframe, at most once per 2 s per session.
-func (ls *liveSession) requestKeyframe(force bool) {
-	ls.winMu.Lock()
-	now := time.Now()
-	if !force && now.Sub(ls.lastKeyReq) < keyframeMinPeriod {
-		ls.keyReqDrops++
-		ls.winMu.Unlock()
-		return
-	}
-	ls.lastKeyReq = now
-	ls.winMu.Unlock()
-	ls.agentControl(contract.AgentControl{Kind: "keyframe"})
-}
-
-// forwardVideoChunk applies the live window (CONTRACTS.md 1.9): over 60 frames or 2 MiB unacknowledged, drop until the
-// next keyframe, ask for one and report viewer_degraded. The recording is never affected.
-func (ls *liveSession) forwardVideoChunk(f *contract.Frame) {
-	vl := ls.currentViewer()
-	if vl == nil {
-		return
-	}
-	keyframe := f.Flags&contract.FlagKeyframe != 0
-	ls.winMu.Lock()
-	over := len(ls.inflight) >= liveWindowFrames || ls.inflightB+len(f.Payload) > liveWindowBytes
-	if ls.dropping && keyframe && !over {
-		ls.dropping = false
-	}
-	congested := over
-	if !ls.dropping && over {
-		ls.dropping = true
-	}
-	dropping := ls.dropping
-	ls.winMu.Unlock()
-	if !dropping {
-		if seq, ok := vl.enqueue(f, true); ok {
-			ls.winMu.Lock()
-			ls.inflight = append(ls.inflight, inflightFrame{seq: seq, size: len(f.Payload)})
-			ls.inflightB += len(f.Payload)
-			ls.winMu.Unlock()
-			return
-		}
-		congested = true
-		ls.winMu.Lock()
-		ls.dropping = true
-		ls.winMu.Unlock()
-	}
-	// Drops while waiting for the first keyframe of a new viewer are not degradation.
-	ls.winMu.Lock()
-	ls.droppedFrames++
-	ls.lastDrop = time.Now()
-	becameDegraded := congested && !ls.degraded
-	if becameDegraded {
-		ls.degraded = true
-	}
-	dropped := ls.droppedFrames
-	ls.winMu.Unlock()
-	if becameDegraded {
-		ls.reportDegraded(true, dropped)
-	}
-	ls.requestKeyframe(false)
-}
-
-// watchAgentLinks replaces the agent link when the runner agent reconnects with the same token (CONTRACTS.md 4.1).
-func (ls *liveSession) watchAgentLinks(p *pendingAgent) {
-	for {
-		select {
-		case <-ls.endCh:
-			return
-		case nl := <-p.links:
-			ls.replaceAgent(nl)
-		}
-	}
-}
-
-func (ls *liveSession) replaceAgent(nl *agentLink) {
-	now := time.Now()
-	ls.mu.Lock()
-	old := ls.agent
-	lostAt := ls.agentLostAt
-	if lostAt.IsZero() {
-		lostAt = now
-	}
-	ls.agent = nl
-	ls.agentLostAt = time.Time{}
-	codec := ls.codec
-	ls.videoConfig = nil
-	ls.mu.Unlock()
-	if old != nil {
-		old.conn.Close()
-	}
-	ls.log.Warn().Msg("Web App agent reconnected, link replaced")
-	ls.record(contract.EventContinuityUnknown, map[string]any{"fromUs": ls.rec.MonoUs(lostAt), "toUs": ls.rec.MonoUs(now), "reason": "agent_disconnected"})
-	ls.releaseHeld()
-	ls.winMu.Lock()
-	ls.dropping = true
-	ls.inflight, ls.inflightB = nil, 0
-	ls.winMu.Unlock()
-	if err := ls.startLive(codec); err != nil {
-		ls.log.Warn().Err(err).Msg("Web App: live_start on the new agent link failed")
-	}
-	go ls.readAgent(nl)
-}
-
-// agentGone waits for a reconnect before ending the session with runner_exit.
-func (ls *liveSession) agentGone(a *agentLink) {
-	ls.mu.Lock()
-	if ls.agent != a {
-		ls.mu.Unlock()
-		return
-	}
-	ls.agentLostAt = time.Now()
-	ls.mu.Unlock()
-	time.AfterFunc(agentReconnectGrace, func() {
-		if ls.currentAgent() == a {
-			ls.end("runner_exit")
-		}
-	})
-}
-
-func (ls *liveSession) readAgent(a *agentLink) {
-	for {
-		f, err := contract.ReadFrame(a.conn, contract.MaxAgentPayload)
-		if err != nil {
-			ls.agentGone(a)
-			return
-		}
-		if ls.currentAgent() != a {
-			return
-		}
-		if f.Type.IsUpstream() {
-			continue
-		}
-		switch f.Type {
-		case contract.FrameVideoConfig:
-			var vc contract.VideoConfig
-			if json.Unmarshal(f.Payload, &vc) == nil {
-				ls.input.setFramebuffer(vc.Width, vc.Height)
-			}
-			ls.mu.Lock()
-			ls.videoConfig = f.Payload
-			ls.mu.Unlock()
-			if vl := ls.currentViewer(); vl != nil {
-				vl.enqueue(&contract.Frame{Type: f.Type, Flags: f.Flags, TimestampUs: f.TimestampUs, Payload: f.Payload}, false)
-			}
-		case contract.FrameVideoChunk:
-			if len(f.Payload) > contract.MaxDownstreamPayload {
-				continue
-			}
-			ls.forwardVideoChunk(&contract.Frame{Type: f.Type, Flags: f.Flags, TimestampUs: f.TimestampUs, Payload: f.Payload})
-		case contract.FrameRecInit:
-			var meta contract.RecInitMeta
-			body, err := contract.UnmarshalMetaPrefixed(f.Payload, &meta)
-			if err == nil {
-				err = ls.rec.RecInit(meta, body)
-			}
-			if err != nil && !errors.Is(err, recorder.ErrClosed) {
-				ls.log.Error().Err(err).Msg("Web App REC_INIT rejected")
-			}
-		case contract.FrameRecSegment:
-			var meta contract.RecSegmentMeta
-			body, err := contract.UnmarshalMetaPrefixed(f.Payload, &meta)
-			if err == nil {
-				err = ls.rec.RecSegment(meta, body)
-			}
-			if err != nil && !errors.Is(err, recorder.ErrClosed) {
-				ls.log.Error().Err(err).Msg("Web App REC_SEGMENT rejected")
-				// A segment that does not match its digest is lost evidence: record it as such.
-				_ = ls.rec.Loss(recorder.LossBody{Stream: "V", FromUs: ls.rec.PtsMonoUs(meta.StartPtsUs), ToUs: ls.rec.PtsMonoUs(meta.EndPtsUs), Count: meta.FrameCount, Reason: "segment_rejected"})
-			}
-		case contract.FrameRecLoss:
-			var rl contract.RecLoss
-			if json.Unmarshal(f.Payload, &rl) != nil {
-				continue
-			}
-			ls.log.Warn().Str("reason", rl.Reason).Int("framesLost", rl.FramesLost).Msg("Web App recorder reported loss")
-			if err := ls.rec.Loss(recorder.LossBody{Stream: "V", FromUs: ls.rec.PtsMonoUs(rl.FromPtsUs), ToUs: ls.rec.PtsMonoUs(rl.ToPtsUs), Count: rl.FramesLost, Reason: rl.Reason}); err != nil && !errors.Is(err, recorder.ErrClosed) {
-				ls.log.Error().Err(err).Msg("Web App loss record failed")
-			}
-			ls.recordingLoss((rl.ToPtsUs - rl.FromPtsUs) / 1000)
-		case contract.FrameAgentEvent:
-			var ev contract.AgentEvent
-			if json.Unmarshal(f.Payload, &ev) == nil {
-				ls.log.Debug().Str("kind", ev.Kind).Msg("Web App agent event")
-			}
-		}
-	}
 }
