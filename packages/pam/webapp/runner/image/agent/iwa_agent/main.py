@@ -1,5 +1,6 @@
 """Runner agent entry point: env, capture + recorder at start, link handshake, control dispatch, shutdown."""
 import json
+import hashlib
 import os
 import re
 import signal
@@ -142,6 +143,7 @@ class Agent:
         self.live_kbps = DEFAULT_LIVE_KBPS
         self.live_paused = False
         self._live_lock = threading.Lock()
+        self.native = None
 
     def start_media(self):
         from .capture import Capture, StallDetector
@@ -246,6 +248,9 @@ class Agent:
         elif kind == "input_enabled":
             if self.injector is not None:
                 self.injector.set_enabled(bool(msg.get("enabled")))
+        elif kind == "form_login" or kind == "ping":
+            if self.native is not None:
+                self.native.send(dict(msg, type=kind))
         elif kind == "shutdown":
             log("shutdown_requested", reason=msg.get("reason"))
             return "stop"
@@ -322,6 +327,32 @@ def run(env):
     reconnecting = False
     try:
         wait_for_display()
+        from .native_bridge import NativeBridge
+        def native_event(message):
+            kind = message.get("type", "")
+            event = {k: v for k, v in message.items() if k != "type"}
+            if kind == "download-complete":
+                path = str(event.get("filename", ""))
+                try:
+                    real = os.path.realpath(path)
+                    if not real.startswith("/quarantine/"):
+                        raise ValueError("download outside quarantine")
+                    hasher = hashlib.sha256()
+                    with open(real, "rb") as source:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            hasher.update(chunk)
+                    digest = hasher.hexdigest()
+                    reported_size = int(event.get("bytes") or 0)
+                    event.update({"filename": os.path.basename(real), "quarantinePath": real,
+                                  "sha256": digest, "size": reported_size if reported_size >= 0 else os.path.getsize(real),
+                                  "mime": event.get("mime", "")})
+                    kind = "download"
+                except (OSError, ValueError) as exc:
+                    log("download_hash_failed", level="warn", error=str(exc))
+                    return
+            agent.outbox.send(frames.AGENT_EVENT, frames.json_bytes({"kind": kind, **event}))
+        agent.native = NativeBridge(native_event, log)
+        agent.native.start()
         from .inject import XInjector
         agent.injector = XInjector(cfg.width, cfg.height, log=log)
         agent.start_media()
@@ -358,6 +389,8 @@ def run(env):
         agent.stop_media()
         if link is not None:
             link.close()
+        if agent.native is not None:
+            agent.native.stop()
         log("agent_exit", code=code)
     return code
 

@@ -76,10 +76,10 @@ func parseFlags() options {
 	flag.BoolVar(&o.startDemoApp, "start-demo-app", false, "start "+demoAppName+" on iwa-apps if it is not running")
 	flag.DurationVar(&o.duration, "duration", 25*time.Second, "minimum collection time after live_start")
 	flag.StringVar(&o.startURL, "start-url", "https://app.corp.internal/input", "runner start URL (-lockdown default: /login)")
-	flag.StringVar(&o.caPath, "ca", "/home/agus/Escritorio/Infisical/spikes/rbi-runner/pki/app-ca.crt", "CA certificate passed as caPem")
+	flag.StringVar(&o.caPath, "ca", envOr("IWA_CA_PATH", siblingAsset("spikes/rbi-runner/pki/app-ca.crt")), "CA certificate passed as caPem")
 	flag.StringVar(&o.hostsOverr, "hosts-override", "app.corp.internal=172.27.0.10", "comma-separated host=ip for the proxy resolver")
 	flag.StringVar(&o.demoAppImage, "demo-app-image", "mitmproxy/mitmproxy:11.1.3", "image for -start-demo-app")
-	flag.StringVar(&o.spikeAppDir, "spike-app-dir", "/home/agus/Escritorio/Infisical/spikes/rbi-runner/app", "spike app dir for -start-demo-app")
+	flag.StringVar(&o.spikeAppDir, "spike-app-dir", envOr("IWA_SPIKE_APP_DIR", siblingAsset("spikes/rbi-runner/app")), "spike app dir for -start-demo-app")
 	flag.StringVar(&o.supLog, "supervisor-log", "", "optional supervisor log file to scan for the runner token")
 	flag.StringVar(&o.codec, "codec", "h264", "live codec sent in live_start: h264 or vp9")
 	flag.BoolVar(&o.lockdown, "lockdown", false, "run the lockdown smoke (F12, Ctrl+Shift+I, Ctrl+N, chrome://settings, Shift+Esc, Ctrl+P, rogue CRX)")
@@ -100,6 +100,13 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func siblingAsset(rel string) string {
+	if cwd, err := os.Getwd(); err == nil {
+		return filepath.Clean(filepath.Join(cwd, "..", "..", rel))
+	}
+	return rel
 }
 
 type check struct {

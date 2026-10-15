@@ -53,6 +53,10 @@ func (a *agentLink) control(c contract.AgentControl) error {
 	return a.sendJSON(contract.FrameAgentControl, c)
 }
 
+func (a *agentLink) extCommand(c contract.ExtCommand) error {
+	return a.sendJSON(contract.FrameExtCommand, c)
+}
+
 // viewerLink owns the downstream writes to the viewer tunnel. A single writer goroutine keeps frames in order and the
 // viewer-link seq counter (rewritten on forwarded VIDEO_* frames) is assigned at enqueue time under the lock, so the
 // agent reader never blocks on a slow viewer: video frames are dropped when the queue is full.
