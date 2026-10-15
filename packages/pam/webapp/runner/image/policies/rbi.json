@@ -1,0 +1,55 @@
+{
+  "URLBlocklist": [
+    "*",
+    "chrome://*",
+    "file://*",
+    "view-source:*",
+    "chrome-extension://*",
+    "devtools://*"
+  ],
+  "DeveloperToolsAvailability": 2,
+  "RemoteDebuggingAllowed": false,
+  "ExtensionInstallBlocklist": [
+    "*"
+  ],
+  "ExtensionInstallSources": [],
+  "ExtensionAllowedTypes": [
+    "extension"
+  ],
+  "ExtensionDeveloperModeSettings": 1,
+  "NativeMessagingBlocklist": [
+    "*"
+  ],
+  "NativeMessagingAllowlist": [
+    "com.infisical.rbi"
+  ],
+  "NativeMessagingUserLevelHosts": false,
+  "PrintingEnabled": false,
+  "PasswordManagerEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "QuicAllowed": false,
+  "WebRtcIPHandling": "disable_non_proxied_udp",
+  "DnsOverHttpsMode": "off",
+  "BuiltInDnsClientEnabled": false,
+  "DownloadDirectory": "/quarantine",
+  "PromptForDownloadLocation": false,
+  "AllowFileSelectionDialogs": false,
+  "IncognitoModeAvailability": 1,
+  "BrowserGuestModeEnabled": false,
+  "BrowserAddPersonEnabled": false,
+  "BrowserSignin": 0,
+  "SyncDisabled": true,
+  "MetricsReportingEnabled": false,
+  "SafeBrowsingProtectionLevel": 0,
+  "SpellcheckEnabled": false,
+  "TranslateEnabled": false,
+  "TaskManagerEndProcessEnabled": false,
+  "BookmarkBarEnabled": false,
+  "EditBookmarksEnabled": false,
+  "BackgroundModeEnabled": false,
+  "DefaultBrowserSettingEnabled": false,
+  "CommandLineFlagSecurityWarningsEnabled": false,
+  "AllowDinosaurEasterEgg": false,
+  "ComponentUpdatesEnabled": false
+}
