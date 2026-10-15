@@ -337,8 +337,11 @@ def run(env):
                     real = os.path.realpath(path)
                     if not real.startswith("/quarantine/"):
                         raise ValueError("download outside quarantine")
+                    hasher = hashlib.sha256()
                     with open(real, "rb") as source:
-                        digest = hashlib.sha256(source.read()).hexdigest()
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            hasher.update(chunk)
+                    digest = hasher.hexdigest()
                     event.update({"filename": os.path.basename(real), "quarantinePath": real,
                                   "sha256": digest, "size": int(event.get("bytes") or os.path.getsize(real)),
                                   "mime": event.get("mime", "")})

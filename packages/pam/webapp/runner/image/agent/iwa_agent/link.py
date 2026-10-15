@@ -114,7 +114,7 @@ class Link:
                 if fr is None:
                     return "eof"
                 try:
-                    if fr.type == frames.AGENT_CONTROL:
+                    if fr.type in (frames.AGENT_CONTROL, frames.EXT_COMMAND):
                         if on_control(fr.json()) == "stop":
                             return "shutdown"
                     elif fr.type == frames.INPUT_INJECT:
