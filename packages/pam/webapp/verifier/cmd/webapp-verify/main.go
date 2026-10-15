@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -36,6 +37,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return verifier.ExitUsage
 	}
 	bundle, err := verifier.LoadBundle(*bundleDir)
+	if errors.Is(err, verifier.ErrMalformedBundle) {
+		fmt.Fprintf(stdout, "%s\n  %v\n", verifier.VerdictTampered, err)
+		return verifier.ExitTampered
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "webapp-verify: %v\n", err)
 		return verifier.ExitUsage

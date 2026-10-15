@@ -130,13 +130,9 @@ func (s *testSession) sealChunk() {
 func (s *testSession) video(kind contract.CheckpointKind, plaintext []byte) {
 	index := uint32(len(s.replay.Video.Objects))
 	sum := sha256.Sum256(plaintext)
-	eventType, kindName := contract.EventVSegment, "media"
-	if kind == contract.KindVideoInit {
-		eventType, kindName = contract.EventVInit, "init"
-	}
-	seq, hash := s.event(eventType, map[string]any{"objectIndex": index, "sha256": hex.EncodeToString(sum[:]), "bytes": len(plaintext)})
+	seq, hash := s.event(videoEventType(kind), map[string]any{"objectIndex": index, "sha256": hex.EncodeToString(sum[:]), "bytes": len(plaintext)})
 	entry := s.seal(contract.SeriesV, kind, index, plaintext, seq, seq, hash)
-	entry.Kind = kindName
+	entry.Kind = videoKindName(kind)
 	s.replay.Video.Objects = append(s.replay.Video.Objects, entry)
 }
 
@@ -164,8 +160,6 @@ type sessionOptions struct {
 	mediaCount int
 }
 
-// recordSession records open, input, the video init, media segments, heartbeats and (optionally) the end record,
-// sealed into two event chunks.
 func recordSession(t *testing.T, opts sessionOptions) *testSession {
 	s := newTestSession(t)
 	s.open()
@@ -192,7 +186,8 @@ func verifyDir(t *testing.T, dir, fingerprint string) *Report {
 	return Verify(b, fingerprint)
 }
 
-// fixtureDir holds a committed verified bundle for the webapp-verify CLI tests and demos. Regenerate with:
+// fixtureDir holds a committed verified bundle for the webapp-verify CLI tests and demos. Its session-key.b64 is the
+// deterministic test key 0x11 repeated, not a secret. Regenerate with:
 // IWA_WRITE_BUNDLE=1 go test ./packages/pam/webapp/verifier/ -run TestFixtureBundle
 const fixtureDir = "testdata/bundle-verified"
 

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,10 +13,17 @@ import (
 )
 
 const (
-	fixtureBundle      = "../../testdata/bundle-verified"
-	fixtureFingerprint = "SHA256:NHUPmL1Z/PyUbaRaqr6TO+FUpLUJThxKv0KGZQXzyX4"
-	otherFingerprint   = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	fixtureBundle    = "../../testdata/bundle-verified"
+	otherFingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 )
+
+var fixtureFingerprint = func() string {
+	b, err := verifier.LoadBundle(fixtureBundle)
+	if err != nil {
+		panic(err)
+	}
+	return b.Replay.RecordingKey.Fingerprint
+}()
 
 func runCLI(args ...string) (int, string, string) {
 	var stdout, stderr bytes.Buffer
@@ -56,4 +65,12 @@ func TestUsageErrors(t *testing.T) {
 			require.Equal(t, verifier.ExitUsage, code)
 		})
 	}
+}
+
+func TestMalformedBundleIsTampered(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, verifier.ReplayFile), []byte("{not json"), 0o644))
+	code, out, _ := runCLI("--bundle", dir, "--fingerprint", fixtureFingerprint)
+	require.Equal(t, verifier.ExitTampered, code)
+	require.True(t, strings.HasPrefix(out, "Tampered\n"), out)
 }
