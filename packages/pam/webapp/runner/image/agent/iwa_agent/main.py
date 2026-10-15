@@ -312,6 +312,34 @@ def connect(cfg, agent, budget_s):
             raise LinkError("link lost while flushing the backlog")
 
 
+def agent_event(message):
+    """Maps an extension native message to its AGENT_EVENT body (CONTRACTS.md 4.5: same JSON, `type` renamed `kind`).
+
+    Returns None when the message must not be forwarded (a download that cannot be hashed in quarantine)."""
+    kind = message.get("type", "")
+    event = {k: v for k, v in message.items() if k != "type"}
+    if kind == "download-complete":
+        path = str(event.get("filename", ""))
+        try:
+            real = os.path.realpath(path)
+            if not real.startswith("/quarantine/"):
+                raise ValueError("download outside quarantine")
+            hasher = hashlib.sha256()
+            with open(real, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            digest = hasher.hexdigest()
+            reported_size = int(event.get("bytes") or 0)
+            event.update({"filename": os.path.basename(real), "quarantinePath": real,
+                          "sha256": digest, "size": reported_size if reported_size >= 0 else os.path.getsize(real),
+                          "mime": event.get("mime", "")})
+            kind = "download"
+        except (OSError, ValueError) as exc:
+            log("download_hash_failed", level="warn", error=str(exc))
+            return None
+    return {"kind": kind, **event}
+
+
 def run(env):
     try:
         cfg = load_config(env)
@@ -329,28 +357,9 @@ def run(env):
         wait_for_display()
         from .native_bridge import NativeBridge
         def native_event(message):
-            kind = message.get("type", "")
-            event = {k: v for k, v in message.items() if k != "type"}
-            if kind == "download-complete":
-                path = str(event.get("filename", ""))
-                try:
-                    real = os.path.realpath(path)
-                    if not real.startswith("/quarantine/"):
-                        raise ValueError("download outside quarantine")
-                    hasher = hashlib.sha256()
-                    with open(real, "rb") as source:
-                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                            hasher.update(chunk)
-                    digest = hasher.hexdigest()
-                    reported_size = int(event.get("bytes") or 0)
-                    event.update({"filename": os.path.basename(real), "quarantinePath": real,
-                                  "sha256": digest, "size": reported_size if reported_size >= 0 else os.path.getsize(real),
-                                  "mime": event.get("mime", "")})
-                    kind = "download"
-                except (OSError, ValueError) as exc:
-                    log("download_hash_failed", level="warn", error=str(exc))
-                    return
-            agent.outbox.send(frames.AGENT_EVENT, frames.json_bytes({"kind": kind, **event}))
+            event = agent_event(message)
+            if event is not None:
+                agent.outbox.send(frames.AGENT_EVENT, frames.json_bytes(event))
         agent.native = NativeBridge(native_event, log)
         agent.native.start()
         from .inject import XInjector

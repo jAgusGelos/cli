@@ -6,5 +6,5 @@
   "permissions": ["nativeMessaging", "downloads", "webNavigation"],
   "host_permissions": ["https://*/*"],
   "background": {"service_worker": "sw.js"},
-  "content_scripts": [{"matches": ["https://*/*"], "js": ["content.js"], "run_at": "document_end"}]
+  "content_scripts": [{"matches": ["https://*/*"], "js": ["content.js"], "run_at": "document_end", "all_frames": true, "match_about_blank": true}]
 }
