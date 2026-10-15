@@ -418,7 +418,23 @@ func (ls *liveSession) serve(ctx context.Context, vl *viewerLink, hello contract
 		v.close(viewerFlushWait)
 	}
 	ls.agentControl(contract.AgentControl{Kind: agentShutdown, Reason: reason})
+	ls.awaitAgentDrain()
 	return nil
+}
+
+// awaitAgentDrain waits for the agent to close its link after shutdown. The agent stops its encoder on shutdown, which
+// emits the last partial REC_SEGMENT; the deferred recorder close must run after that segment, or a session shorter
+// than one segment interval has no video at all.
+func (ls *liveSession) awaitAgentDrain() {
+	a := ls.currentAgent()
+	if a == nil {
+		return
+	}
+	select {
+	case <-a.done:
+	case <-time.After(agentDrainTimeout):
+		ls.log.Warn().Dur("timeout", agentDrainTimeout).Msg("Web App agent did not close its link after shutdown; the last recording segment may be lost")
+	}
 }
 
 func failSession(vl *viewerLink, l zerolog.Logger, code string, err error) error {

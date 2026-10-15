@@ -166,6 +166,7 @@ func (ls *liveSession) agentGone(a *agentLink) {
 }
 
 func (ls *liveSession) readAgent(a *agentLink) {
+	defer close(a.done)
 	for {
 		f, err := contract.ReadFrame(a.conn, contract.MaxAgentPayload)
 		if err != nil {

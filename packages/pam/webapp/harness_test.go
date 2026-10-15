@@ -89,6 +89,15 @@ type fakeAgent struct {
 	injected chan contract.InputBatch
 	initBody []byte
 	segBody  []byte
+	// finalSegBody, when set, is sent as a REC_SEGMENT after shutdown, the way the real agent's encoder flushes its
+	// last partial fragment before it closes the link.
+	finalSegBody []byte
+}
+
+func (a *fakeAgent) setFinalSegment(body []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.finalSegBody = body
 }
 
 // startFakeAgent dials the gateway, says AGENT_HELLO and, on live_start, sends REC_INIT, REC_SEGMENT, VIDEO_CONFIG and
@@ -144,6 +153,15 @@ func startFakeAgent(t *testing.T, addr, sessionID, token, mode string) *fakeAgen
 					send(contract.FrameVideoChunk, contract.FlagKeyframe, []byte{0, 0, 0, 1, 0x65, 0x88})
 				}
 				if ac.Kind == "shutdown" {
+					a.mu.Lock()
+					final := a.finalSegBody
+					a.mu.Unlock()
+					if final != nil {
+						time.Sleep(200 * time.Millisecond)
+						sum := sha256.Sum256(final)
+						segP, _ := contract.MarshalMetaPrefixed(contract.RecSegmentMeta{SegmentIndex: 2, StartPtsUs: 10_000_000, EndPtsUs: 14_000_000, FrameCount: 120, FramesCaptured: 120, SHA256: hex.EncodeToString(sum[:])}, final)
+						send(contract.FrameRecSegment, 0, segP)
+					}
 					c.Close()
 					return
 				}
@@ -365,6 +383,23 @@ func TestVS1Harness(t *testing.T) {
 	require.Equal(t, float64(last.Seq), end["finalSeq"])
 	require.NotEmpty(t, h.backend.Opens)
 	require.Equal(t, "end", h.backend.Order[len(h.backend.Order)-1])
+}
+
+// The agent flushes its last partial segment only after shutdown. The recorder must still be open when it arrives,
+// otherwise a session shorter than one segment interval records an init and no video.
+func TestFinalSegmentAfterShutdownIsRecorded(t *testing.T) {
+	h := newHarness(t)
+	v, agent, done := startSession(t, h, h.params())
+	final := []byte("\x00\x00\x00\x10moof final partial segment")
+	agent.setFinalSegment(final)
+	v.endSession(t, done)
+
+	res, err := h.backend.Verify(h.key, hSession, h.svc.RecordingPublicKey())
+	require.NoError(t, err)
+	require.Len(t, res.VMedia, 2)
+	require.Equal(t, agent.segBody, res.VMedia[0])
+	require.Equal(t, final, res.VMedia[1])
+	require.Equal(t, contract.EventSessionEnd, res.Events[len(res.Events)-1].Type, "session_end is the last event")
 }
 
 func TestAgentHelloRefused(t *testing.T) {
