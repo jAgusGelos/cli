@@ -19,7 +19,13 @@ function connect() {
   port.onDisconnect.addListener(() => { port = null; setTimeout(connect, 1000); });
   send({type: 'ext_hello', extVersion: chrome.runtime.getManifest().version, extensionId: chrome.runtime.id});
 }
-chrome.runtime.onMessage.addListener((m, sender) => send({...m, frameUrl: sender.url || '', tabId: sender.tab && sender.tab.id, frameId: sender.frameId}));
+chrome.runtime.onMessage.addListener((m, sender) => {
+  if (m.type === 'login_result' && sender.tab) {
+    const p = pending.get(sender.tab.id);
+    if (p && p.requestId === m.requestId) pending.delete(sender.tab.id);
+  }
+  send({...m, frameUrl: sender.url || '', tabId: sender.tab && sender.tab.id, frameId: sender.frameId});
+});
 chrome.downloads.onChanged.addListener(async (change) => {
   if (change.state && change.state.current === 'complete') {
     const rows = await chrome.downloads.search({id: change.id});
