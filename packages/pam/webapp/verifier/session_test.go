@@ -127,6 +127,17 @@ func (s *testSession) sealChunk() {
 	s.pending, s.firstSeq = nil, last+1
 }
 
+// reseal signs a copy of event chunk 0 as chunk index, so its seq range overlaps the chunks before it.
+func (s *testSession) reseal(t *testing.T, chunk int, index uint32) ObjectEntry {
+	aad := contract.BuildAAD(testProjectID, testSessionID, contract.SeriesE, uint32(chunk))
+	plaintext, err := contract.OpenObject(s.aesKey, s.stored[StoredObjectPath(contract.SeriesE, uint32(chunk))], aad)
+	require.NoError(t, err)
+	envelopes, _, err := contract.ParseEnvelopes(plaintext)
+	require.NoError(t, err)
+	first, last := envelopes[0].Seq, envelopes[len(envelopes)-1].Seq
+	return s.seal(contract.SeriesE, contract.KindEvents, index, plaintext, first, last, envelopes[len(envelopes)-1].Hash())
+}
+
 func (s *testSession) video(kind contract.CheckpointKind, plaintext []byte) {
 	index := uint32(len(s.replay.Video.Objects))
 	sum := sha256.Sum256(plaintext)
