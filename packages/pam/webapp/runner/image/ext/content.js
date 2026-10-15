@@ -7,6 +7,9 @@ chrome.runtime.sendMessage({type: 'page', url: location.href, title: document.ti
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type !== 'form_login') return;
   const recipe = message.recipe || {};
+  if (recipe.loginUrl && !location.href.startsWith(recipe.loginUrl)) {
+    return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: false, reason: 'success_check_failed', url: location.href});
+  }
   const user = document.querySelector(recipe.usernameSelector);
   const pass = document.querySelector(recipe.passwordSelector);
   const submit = document.querySelector(recipe.submitSelector);
@@ -20,7 +23,7 @@ chrome.runtime.onMessage.addListener((message) => {
   const poll = () => {
     let ok = false;
     if (check.type === 'selector_present') ok = Boolean(document.querySelector(check.value));
-    else if (check.type === 'url_matches') ok = new RegExp(check.value || '').test(location.href);
+    else if (check.type === 'url_prefix') ok = location.href.startsWith(check.value || '');
     if (ok) return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: true, reason: 'success_check_passed', url: location.href});
     if (Date.now() >= deadline) return chrome.runtime.sendMessage({type: 'login_result', requestId: message.requestId, ok: false, reason: 'timeout', url: location.href});
     setTimeout(poll, 250);

@@ -6,7 +6,11 @@ SOCKET = "/tmp/iwa/native.sock"
 
 def read_message(stream):
     if isinstance(stream, socket.socket):
-        header = stream.recv(4)
+        header = b""
+        while len(header) < 4:
+            part = stream.recv(4 - len(header))
+            if not part: return None
+            header += part
     else:
         header = stream.read(4)
     if len(header) != 4: return None

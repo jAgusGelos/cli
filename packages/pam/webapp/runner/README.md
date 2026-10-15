@@ -19,7 +19,7 @@ go build -o /tmp/iwa/iwa-harness ./packages/pam/webapp/runner/harness
 ```
 
 Current image (M3, 2026-10-15 15:45):
-`infisical-webapp-runner@sha256:b218d1f9a42b2515b704a73e419e0f3d93e95cb48711ac912f9bedfc7ae846c0`
+`infisical-webapp-runner@sha256:47345a04ec96d324c93b6c84df52452e8ec5ccfd882d74ee2c42e356ebde5844`
 (Chromium `155.0.8059.79-1~deb13u1`, base `debian@sha256:04634311...0a28a`). Every rebuild changes the digest: refresh
 both env lines below.
 
@@ -31,9 +31,9 @@ digest (checked by the harness).
 
 ```bash
 # supervisor (demo only: a release build ships the allowlist of Infisical-published digests instead)
-INFISICAL_WEBAPP_RUNNER_IMAGES=infisical-webapp-runner@sha256:b218d1f9a42b2515b704a73e419e0f3d93e95cb48711ac912f9bedfc7ae846c0
+INFISICAL_WEBAPP_RUNNER_IMAGES=infisical-webapp-runner@sha256:47345a04ec96d324c93b6c84df52452e8ec5ccfd882d74ee2c42e356ebde5844
 # gateway: the image ref it sends as `image` in POST /v1/runners
-INFISICAL_WEBAPP_RUNNER_IMAGE=infisical-webapp-runner@sha256:b218d1f9a42b2515b704a73e419e0f3d93e95cb48711ac912f9bedfc7ae846c0
+INFISICAL_WEBAPP_RUNNER_IMAGE=infisical-webapp-runner@sha256:47345a04ec96d324c93b6c84df52452e8ec5ccfd882d74ee2c42e356ebde5844
 # both sides, optional override of /tmp/infisical-webapp/supervisor.sock
 INFISICAL_WEBAPP_SUPERVISOR_SOCKET=/tmp/infisical-webapp/supervisor.sock
 ```

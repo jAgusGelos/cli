@@ -4,8 +4,11 @@ import json, os, socket, struct, threading
 SOCKET = "/tmp/iwa/native.sock"
 
 def _read(stream):
-    h = stream.recv(4)
-    if len(h) != 4: return None
+    h = b""
+    while len(h) < 4:
+        part = stream.recv(4 - len(h))
+        if not part: return None
+        h += part
     n = struct.unpack("<I", h)[0]
     if n > 4 * 1024 * 1024: return None
     data = b""
