@@ -106,6 +106,7 @@ type Service struct {
 
 	mu       sync.Mutex
 	pending  map[string]*pendingAgent
+	live     map[string]*liveSession
 	agentLn  net.Listener
 	proxyLn  net.Listener
 	closed   bool
@@ -134,6 +135,7 @@ func NewService(cfg Config, apiClient *resty.Client) (*Service, error) {
 		log:     l,
 		settled: make(chan struct{}),
 		pending: map[string]*pendingAgent{},
+		live:    map[string]*liveSession{},
 	}
 	s.newBackend = func(sessionID, uploadToken string) recorder.Backend {
 		return recorder.NewHTTPBackend(cfg.BackendURL, sessionID, uploadToken, apiClient)

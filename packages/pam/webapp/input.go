@@ -31,11 +31,17 @@ type droppedEntry struct {
 	Bytes  *int   `json:"bytes,omitempty"`
 }
 
+// l3Event is a recorded input event; synthetic marks gateway-generated releases (CONTRACTS.md section 7).
+type l3Event struct {
+	contract.InputEvent
+	Synthetic bool `json:"synthetic,omitempty"`
+}
+
 type l3Input struct {
-	Events   []contract.InputEvent `json:"events"`
-	Dropped  []droppedEntry        `json:"dropped"`
-	Masked   bool                  `json:"masked"`
-	FrameSeq uint32                `json:"frameSeq"`
+	Events   []l3Event      `json:"events"`
+	Dropped  []droppedEntry `json:"dropped"`
+	Masked   bool           `json:"masked"`
+	FrameSeq uint32         `json:"frameSeq"`
 }
 
 var errMalformed = errors.New("malformed input")
@@ -45,13 +51,59 @@ type inputPath struct {
 	filter *contract.InputFilter
 
 	mu          sync.Mutex
+	heldKeys    map[string]contract.InputEvent // injected key down without its up, by code
+	heldButtons map[int]contract.InputEvent
 	fbW, fbH    int
 	malformed   []time.Time
 	lastMoveRec time.Time
 }
 
 func newInputPath(width, height int) *inputPath {
-	return &inputPath{filter: contract.NewInputFilter(), fbW: width, fbH: height}
+	return &inputPath{filter: contract.NewInputFilter(), fbW: width, fbH: height,
+		heldKeys: map[string]contract.InputEvent{}, heldButtons: map[int]contract.InputEvent{}}
+}
+
+// trackInjected remembers what the agent holds down after injecting kept.
+func (p *inputPath) trackInjected(kept []contract.InputEvent) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ev := range kept {
+		switch {
+		case ev.T == "key" && ev.Action == "down":
+			p.heldKeys[ev.Code] = ev
+		case ev.T == "key" && ev.Action == "up":
+			delete(p.heldKeys, ev.Code)
+		case ev.T == "button" && ev.Action == "down":
+			p.heldButtons[ev.Button] = ev
+		case ev.T == "button" && ev.Action == "up":
+			delete(p.heldButtons, ev.Button)
+		}
+	}
+}
+
+// releases returns a key up for every held key and a button up for every held button, then clears the filter state.
+func (p *inputPath) releases() []contract.InputEvent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []contract.InputEvent
+	for code, ev := range p.heldKeys {
+		out = append(out, contract.InputEvent{T: "key", Action: "up", Code: code, Key: ev.Key})
+	}
+	for b, ev := range p.heldButtons {
+		out = append(out, contract.InputEvent{T: "button", Action: "up", Button: b, X: ev.X, Y: ev.Y})
+	}
+	p.heldKeys = map[string]contract.InputEvent{}
+	p.heldButtons = map[int]contract.InputEvent{}
+	p.filter = contract.NewInputFilter()
+	return out
+}
+
+func toL3(evs []contract.InputEvent, synthetic bool) []l3Event {
+	out := make([]l3Event, 0, len(evs))
+	for _, ev := range evs {
+		out = append(out, l3Event{InputEvent: ev, Synthetic: synthetic})
+	}
+	return out
 }
 
 // setFramebuffer updates the coordinate bounds from VIDEO_CONFIG.
@@ -113,7 +165,7 @@ func (p *inputPath) process(payload []byte, frameSeq uint32, arrival time.Time) 
 			}
 		}
 		p.malformed = append(kept, arrival)
-		rec = &l3Input{Events: []contract.InputEvent{}, Dropped: []droppedEntry{{T: "malformed", Rule: "malformed"}}, FrameSeq: frameSeq}
+		rec = &l3Input{Events: []l3Event{}, Dropped: []droppedEntry{{T: "malformed", Rule: "malformed"}}, FrameSeq: frameSeq}
 		return nil, rec, len(p.malformed) >= malformedLimit, errMalformed
 	}
 
@@ -154,12 +206,12 @@ func (p *inputPath) process(payload []byte, frameSeq uint32, arrival time.Time) 
 		dropped = []droppedEntry{}
 	}
 	if len(recorded) > 0 || len(dropped) > 0 {
-		rec = &l3Input{Events: recorded, Dropped: dropped, FrameSeq: frameSeq}
+		rec = &l3Input{Events: toL3(recorded, false), Dropped: dropped, FrameSeq: frameSeq}
 	}
 	return kept, rec, false, nil
 }
 
 // clipboardBlocked is the L3 body for a dropped CLIPBOARD_UP frame.
 func clipboardBlocked(n int, frameSeq uint32) *l3Input {
-	return &l3Input{Events: []contract.InputEvent{}, Dropped: []droppedEntry{{T: "clipboard_blocked", Bytes: &n}}, FrameSeq: frameSeq}
+	return &l3Input{Events: []l3Event{}, Dropped: []droppedEntry{{T: "clipboard_blocked", Bytes: &n}}, FrameSeq: frameSeq}
 }
