@@ -351,3 +351,10 @@ func TestMalformedBundle(t *testing.T) {
 	_, err := LoadBundle(dir)
 	require.ErrorIs(t, err, ErrMalformedBundle)
 }
+
+func TestOverlappingChunkIsTampered(t *testing.T) {
+	s := recordSession(t, sessionOptions{withEnd: true, mediaCount: 1})
+	s.replay.Events.Chunks = append(s.replay.Events.Chunks, s.reseal(t, 0, 2))
+	report := verifyDir(t, s.write(), s.fingerprint())
+	require.Equal(t, VerdictTampered, report.Verdict, "findings: %+v", report.Findings)
+}

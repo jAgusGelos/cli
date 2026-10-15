@@ -59,6 +59,10 @@ func (v *verification) verifyChunk(subject string, chunk checkedObject, nextSeq 
 		v.report.tampered(subject, "event chunk does not parse: %v", err)
 		return true
 	}
+	if c.FirstSeq < nextSeq {
+		v.report.tampered(subject, "seq overlap: checkpoint starts at %d, earlier chunks reach %d", c.FirstSeq, nextSeq-1)
+		return true
+	}
 	if c.FirstSeq != nextSeq {
 		v.chainGap = true
 		v.report.incomplete(subject, "gap: expected first seq %d, checkpoint starts at %d", nextSeq, c.FirstSeq)
