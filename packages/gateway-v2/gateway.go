@@ -18,10 +18,12 @@ import (
 	"time"
 
 	"github.com/Infisical/infisical-merge/packages/api"
+	infisicalconfig "github.com/Infisical/infisical-merge/packages/config"
 	"github.com/Infisical/infisical-merge/packages/gateway-v2/winrm"
 	"github.com/Infisical/infisical-merge/packages/pam"
 	"github.com/Infisical/infisical-merge/packages/pam/handlers/mongodb"
 	"github.com/Infisical/infisical-merge/packages/pam/session"
+	"github.com/Infisical/infisical-merge/packages/pam/webapp"
 	"github.com/Infisical/infisical-merge/packages/systemd"
 	"github.com/Infisical/infisical-merge/packages/util"
 	"github.com/go-resty/resty/v2"
@@ -38,6 +40,7 @@ const (
 	ForwardModeTCP             ForwardMode = "TCP"
 	ForwardModePAM             ForwardMode = "PAM"
 	ForwardModePAMRDPBrowser   ForwardMode = "PAM_RDP_BROWSER"
+	ForwardModePAMWebApp       ForwardMode = "PAM_WEB_APP"
 	ForwardModePAMCancellation ForwardMode = "PAM_CANCELLATION"
 	ForwardModePAMCapabilities ForwardMode = "PAM_CAPABILITIES"
 	ForwardModePing            ForwardMode = "PING"
@@ -141,6 +144,9 @@ type Gateway struct {
 	// PAM session uploader
 	pamSessionUploader *session.SessionUploader
 
+	// Web App sessions (nil when the recording key cannot be loaded)
+	webApp *webapp.Service
+
 	// mTLS server components
 	tlsConfig atomic.Pointer[tls.Config]
 
@@ -204,7 +210,16 @@ func NewGateway(config *GatewayConfig) (*Gateway, error) {
 		return nil, fmt.Errorf("failed to load PKCS#11 module: %w", err)
 	}
 
+	webAppCfg := webapp.ConfigFromEnv(session.GetSessionRecordingDir())
+	webAppCfg.BackendURL = infisicalconfig.INFISICAL_URL
+	webAppService, err := webapp.NewService(webAppCfg, httpClient)
+	if err != nil {
+		log.Warn().Err(err).Msg("Web App sessions disabled: recording key unavailable")
+		webAppService = nil
+	}
+
 	return &Gateway{
+		webApp:                webAppService,
 		httpClient:            httpClient,
 		config:                config,
 		relayName:             config.RelayName,
@@ -561,6 +576,11 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 	// Start session uploader goroutine for PAM
 	g.pamSessionUploader.Start()
+
+	if g.webApp != nil {
+		g.webApp.SetGatewayID(g.GatewayID)
+		g.webApp.Start(ctx)
+	}
 
 	go g.startIdleReaper(ctx)
 
@@ -1205,7 +1225,7 @@ func (g *Gateway) handleGatewayConnection(conn net.Conn, onHandshakeSettled func
 			log.Info().Msg("TCP proxy handler completed")
 		}
 		return
-	} else if forwardConfig.Mode == ForwardModePAM || forwardConfig.Mode == ForwardModePAMRDPBrowser {
+	} else if forwardConfig.Mode == ForwardModePAM || forwardConfig.Mode == ForwardModePAMRDPBrowser || forwardConfig.Mode == ForwardModePAMWebApp {
 		// RDP only: prior bridge must fully tear down before the new one starts,
 		// else overlapping drains write non-monotonic elapsedMs to the recording.
 		if forwardConfig.PAMConfig.ResourceType == session.ResourceTypeWindows {
@@ -1218,8 +1238,7 @@ func (g *Gateway) handleGatewayConnection(conn net.Conn, onHandshakeSettled func
 			g.DeregisterPAMSession(forwardConfig.PAMConfig.SessionId, tlsConn)
 		}()
 		forwardConfig.PAMConfig.OnActivity = touchSession
-		browserRDP := forwardConfig.Mode == ForwardModePAMRDPBrowser
-		if err := pam.HandlePAMProxy(sessionCtx, tlsConn, &forwardConfig.PAMConfig, g.httpClient, browserRDP); err != nil {
+		if err := pam.HandlePAMProxy(sessionCtx, tlsConn, &forwardConfig.PAMConfig, g.httpClient, pamProxyModeFor(forwardConfig.Mode)); err != nil {
 			if err.Error() == "unexpected EOF" {
 				log.Debug().Err(err).Msg("PAM proxy handler ended with unexpected connection termination")
 			} else {
@@ -1350,6 +1369,10 @@ func (g *Gateway) parseForwardConfigFromALPN(tlsConn *tls.Conn, reader *bufio.Re
 		config.Mode = ForwardModePAMRDPBrowser
 		return config, nil
 
+	case "infisical-pam-web-app":
+		config.Mode = ForwardModePAMWebApp
+		return config, nil
+
 	case "infisical-pam-session-cancellation":
 		config.Mode = ForwardModePAMCancellation
 		return config, nil
@@ -1478,6 +1501,7 @@ func (g *Gateway) parseDetailsFromCertificate(tlsConn *tls.Conn, config *Forward
 				CredentialsManager: g.pamCredentialsManager,
 				SessionUploader:    g.pamSessionUploader,
 				GetMongoProxy:      g.GetOrCreateMongoProxy,
+				WebApp:             g.webApp,
 			}
 		}
 	}
@@ -1564,6 +1588,7 @@ func nextProtosForGateway(pkcs11Loaded bool) []string {
 		"infisical-ping",
 		"infisical-pam-proxy",
 		"infisical-pam-rdp-browser",
+		"infisical-pam-web-app",
 		"infisical-pam-session-cancellation",
 		"infisical-pam-capabilities",
 		"infisical-adcs",
@@ -1576,4 +1601,14 @@ func nextProtosForGateway(pkcs11Loaded bool) []string {
 		base = append(base, "infisical-pkcs11")
 	}
 	return base
+}
+
+func pamProxyModeFor(mode ForwardMode) pam.PAMProxyMode {
+	switch mode {
+	case ForwardModePAMRDPBrowser:
+		return pam.PAMProxyModeRDPBrowser
+	case ForwardModePAMWebApp:
+		return pam.PAMProxyModeWebApp
+	}
+	return pam.PAMProxyModeDefault
 }

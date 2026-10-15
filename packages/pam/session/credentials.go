@@ -52,6 +52,7 @@ type PAMCredentials struct {
 	Role                  string
 	PrivateKeyPassphrase  string
 	PolicyRules           *api.PAMPolicyRules
+	WebApp                *api.PAMWebAppDetails
 }
 
 type PAMRecordingSecrets struct {
@@ -217,6 +218,7 @@ func (cm *CredentialsManager) GetPAMSessionCredentials(sessionId string, expiryT
 		Role:                  response.Credentials.Role,
 		PrivateKeyPassphrase:  response.Credentials.PrivateKeyPassphrase,
 		PolicyRules:           response.PolicyRules,
+		WebApp:                response.Credentials.WebApp,
 	}
 
 	cacheExpiry := expiryTime
